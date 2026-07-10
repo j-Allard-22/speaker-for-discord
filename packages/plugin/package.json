@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "rollup -c",
-    "watch": "rollup -c -w --watch.onEnd=\"streamdeck restart com.joallard.discord-speaker\""
+    "watch": "rollup -c -w --watch.onEnd=\"streamdeck restart com.vitamin.speaker-for-discord\""
   },
   "dependencies": {
     "@dsd/shared": "*",

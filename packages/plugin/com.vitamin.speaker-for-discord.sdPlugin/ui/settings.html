@@ -10,6 +10,10 @@
       color: #969696;
       white-space: pre-line;
     }
+    .hint {
+      font-size: 10px;
+      color: #7a7a7a;
+    }
     details.guide {
       margin: 8px 6px;
       font-size: 11px;
@@ -36,21 +40,37 @@
   </sdpi-item>
 
   <sdpi-item label="Client Secret">
-    <sdpi-password setting="clientSecret" global placeholder="OAuth2 Client Secret"></sdpi-password>
+    <sdpi-password setting="clientSecret" global placeholder="Leave blank if Public Client is enabled"></sdpi-password>
+  </sdpi-item>
+
+  <sdpi-item label="">
+    <div class="hint">
+      Recommended: on your app's <b>OAuth2</b> tab enable <b>Public Client</b>, then leave the
+      secret blank &mdash; the plugin uses PKCE and no secret is ever stored.
+    </div>
+  </sdpi-item>
+
+  <sdpi-item label="Status">
+    <div id="status-line">connecting&hellip;</div>
   </sdpi-item>
 
   <sdpi-item label="">
     <sdpi-button id="reauthorize">Re-authorize</sdpi-button>
   </sdpi-item>
   <sdpi-item label="">
-    <div id="reauth-hint" style="font-size:10px;color:#7a7a7a">
-      Only needed when the key shows “Authorize”. Saving credentials above already
-      triggers Discord's consent dialog — check the Discord app for it.
+    <div class="hint">
+      Only needed when the key shows &ldquo;Authorize&rdquo;. Saving credentials above already
+      triggers Discord's consent dialog &mdash; check the Discord app for it.
     </div>
   </sdpi-item>
 
-  <sdpi-item label="Status">
-    <div id="status-line">connecting…</div>
+  <sdpi-item label="">
+    <sdpi-button id="forget">Forget credentials</sdpi-button>
+  </sdpi-item>
+  <sdpi-item label="">
+    <div class="hint">
+      Clears the Client ID/Secret and deletes the stored Discord tokens from this computer.
+    </div>
   </sdpi-item>
 
   <sdpi-item label="Helper port">
@@ -62,14 +82,20 @@
     <ol>
       <li>Open <code>discord.com/developers/applications</code> &rarr; <b>New Application</b>.</li>
       <li>Copy the <b>Application ID</b> into <i>Client ID</i> above.</li>
-      <li><b>OAuth2</b> page &rarr; <b>Reset Secret</b> &rarr; paste into <i>Client Secret</i> (shown once!).</li>
+      <li>On the <b>OAuth2</b> tab, enable <b>Public Client</b>. (Then no Client Secret is needed.)</li>
       <li>Under <b>OAuth2 &rarr; Redirects</b> add exactly <code>http://127.0.0.1</code> and save.</li>
       <li>If an <b>RPC Origins</b> field exists, add <code>http://127.0.0.1</code> there too.</li>
       <li>No bot needed. If one exists: <b>Public Bot OFF</b>.</li>
       <li>When Discord pops its authorization dialog, click <b>Authorize</b> (once).</li>
     </ol>
-    <p>Note: keep the Discord <i>desktop</i> app running, and don't set a custom image on
-    this key in Stream Deck — it would permanently cover the live avatar.</p>
+    <p>
+      If you'd rather not enable Public Client, press <b>Reset Secret</b> on the OAuth2 tab and
+      paste it above instead.
+    </p>
+    <p>
+      Keep the Discord <i>desktop</i> app running, and don't set a custom image on this key in
+      Stream Deck &mdash; it would permanently cover the live avatar.
+    </p>
   </details>
 
   <script>
@@ -78,6 +104,11 @@
 
     document.getElementById("reauthorize").addEventListener("click", () => {
       streamDeckClient.send("sendToPlugin", { event: "reauthorize" });
+    });
+
+    document.getElementById("forget").addEventListener("click", () => {
+      streamDeckClient.send("sendToPlugin", { event: "forgetCredentials" });
+      statusLine.textContent = "Credentials cleared. Enter a Client ID to reconnect.";
     });
 
     // SECURITY: channel names are Discord-controlled -> textContent ONLY, never innerHTML.
@@ -89,10 +120,13 @@
       if (p.discord === "subscribed" && p.channelName) discord += ` (#${p.channelName})`;
       if (p.detail) discord += ` — ${p.detail}`;
       lines.push(discord);
-      if (p.authRequired === "no_credentials") lines.push("Enter your Client ID + Secret above.");
-      if (p.authRequired === "consent_required") lines.push("Authorization needed: press Re-authorize, then approve in Discord.");
+      if (p.helper === "port_conflict")
+        lines.push("Another program is using the helper port — change 'Helper port' above.");
+      if (p.authRequired === "no_credentials") lines.push("Enter your Client ID above.");
+      if (p.authRequired === "consent_required")
+        lines.push("Authorization needed: press Re-authorize, then approve in Discord.");
       if (p.authRequired === "token_invalid") lines.push("Session expired: press Re-authorize.");
-      if (p.fatalError) lines.push(`Error: ${p.fatalError}`);
+      if (p.fatalError) lines.push(p.fatalError);
       statusLine.textContent = lines.join("\n");
     }
 

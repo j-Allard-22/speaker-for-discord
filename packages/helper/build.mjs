@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const outDir = join(here, "..", "plugin", "com.joallard.discord-speaker.sdPlugin", "bin");
+const outDir = join(here, "..", "plugin", "com.vitamin.speaker-for-discord.sdPlugin", "bin");
 const outFile = join(outDir, "helper.mjs");
 const metaFile = join(outDir, "helper.meta.json");
 const watch = process.argv.includes("--watch");

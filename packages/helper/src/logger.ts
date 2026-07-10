@@ -1,24 +1,40 @@
 /**
- * File logger for the helper. Writes to %LOCALAPPDATA%\DiscordSpeakerHelper\helper.log
+ * File logger for the helper. Writes to %LOCALAPPDATA%\<StateDir>\helper.log
  * (NEVER inside the .sdPlugin folder — open handles there would block plugin updates)
  * and mirrors to the console for standalone runs.
  *
- * Redaction: values of secret-ish keys are scrubbed before serialization. Never log
- * token-endpoint bodies or AUTHENTICATE args directly — pass everything through the
- * logger's data parameter so redact() sees it.
+ * Level: defaults to `info`. `debug` is opt-in (`--log-level debug` or DSD_LOG_LEVEL)
+ * because debug traffic includes RPC command arguments carrying channel IDs.
+ *
+ * Redaction: values of secret-ish keys are scrubbed before serialization, in BOTH the
+ * wire casing (`access_token`) and our own storage casing (`accessToken`). Never log
+ * token-endpoint bodies or AUTHENTICATE args directly — pass them as the `data`
+ * argument so redact() sees them.
  */
-import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { appendFileSync, existsSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { helperStateDir } from "@dsd/shared";
+
+export { helperStateDir };
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
+const ROTATE_CHECK_EVERY = 200;
 
-/** Keys whose *string* values are secrets. Numeric values (e.g. RPC error `code`) pass. */
-const SECRET_KEY = /^(access_token|refresh_token|client_secret|code|secret|token|password)$/i;
+/**
+ * Keys whose *string* values are secrets — wire casing and StoredAuth casing.
+ * Numeric values (e.g. an RPC error `code`) are left alone.
+ */
+const SECRET_KEY =
+  /^(access_token|refresh_token|client_secret|code|secret|token|password|accessToken|refreshToken|clientSecret|codeVerifier|code_verifier)$/i;
 
-export function helperStateDir(): string {
-  const base = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
-  return join(base, "DiscordSpeakerHelper");
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+
+export function resolveLogLevel(value: string | undefined): LogLevel {
+  return value === "debug" || value === "info" || value === "warn" || value === "error"
+    ? value
+    : "info";
 }
 
 export function redact(value: unknown): unknown {
@@ -33,19 +49,23 @@ export function redact(value: unknown): unknown {
   return value;
 }
 
-export type LogLevel = "debug" | "info" | "warn" | "error";
-
 export class HelperLogger {
   private readonly file: string;
-  private mirrorToConsole: boolean;
+  private readonly mirrorToConsole: boolean;
+  private readonly minRank: number;
   private writesSinceRotateCheck = 0;
 
-  constructor(opts: { dir?: string; mirrorToConsole?: boolean } = {}) {
+  constructor(opts: { dir?: string; mirrorToConsole?: boolean; minLevel?: LogLevel } = {}) {
     const dir = opts.dir ?? helperStateDir();
-    mkdirSync(dir, { recursive: true });
     this.file = join(dir, "helper.log");
     this.mirrorToConsole = opts.mirrorToConsole ?? true;
+    this.minRank = LEVEL_RANK[opts.minLevel ?? "info"];
     this.rotateIfHuge();
+  }
+
+  /** True when debug output would be written — lets callers skip building payloads. */
+  get debugEnabled(): boolean {
+    return this.minRank <= LEVEL_RANK.debug;
   }
 
   debug(msg: string, data?: unknown): void {
@@ -69,12 +89,13 @@ export class HelperLogger {
   }
 
   private write(level: LogLevel, msg: string, data?: unknown): void {
+    if (LEVEL_RANK[level] < this.minRank) return;
     const line = this.format(level, msg, data);
     try {
       appendFileSync(this.file, line + "\n");
       // Rotation must also happen while RUNNING — a wedged retry loop once grew the
       // log to 17 MB because the size was only checked at startup.
-      if (++this.writesSinceRotateCheck >= 200) {
+      if (++this.writesSinceRotateCheck >= ROTATE_CHECK_EVERY) {
         this.writesSinceRotateCheck = 0;
         this.rotateIfHuge();
       }

@@ -9,28 +9,22 @@
  *   pid exit, then respawn. Checked at plugin startup only — no fs-watching (rapid dev
  *   saves would burn Discord's ~2/min connection budget).
  * - Respawn backoff: 1 s -> x2 -> cap 60 s; reset after 5 min of healthy connection.
- * - The helper runs with cwd + logs + state under %LOCALAPPDATA%\DiscordSpeakerHelper —
+ * - The helper runs with cwd + logs + state under %LOCALAPPDATA%\SpeakerForDiscord —
  *   NOTHING inside .sdPlugin is opened for write (Windows locks would break updates).
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HELPER_STATE_DIRNAME, PROTOCOL_VERSION, type HelloMessage } from "@dsd/shared";
-import type { HelperClient } from "./helper-client";
+import { helperStateDir } from "@dsd/shared";
+import type { HelperClient, HelperIdentity } from "./helper-client";
 
 const RESPAWN_BASE_MS = 1_000;
 const RESPAWN_CAP_MS = 60_000;
 const HEALTHY_RESET_MS = 5 * 60_000;
 const PID_EXIT_TIMEOUT_MS = 5_000;
 
-export function helperStateDir(): string {
-  const base = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
-  const dir = join(base, HELPER_STATE_DIRNAME);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
+export { helperStateDir };
 
 /** <sdPlugin>/ — derived from the bundled plugin.js location (bin/plugin.js). */
 export function sdPluginDir(): string {
@@ -50,7 +44,10 @@ export class HelperManager {
   private swapping = false;
 
   constructor(private readonly opts: HelperManagerOptions) {
-    opts.client.on("connected", (hello: HelloMessage) => this.onConnected(hello));
+    // `identity` comes from the post-auth `welcome`, so buildId/pid are only ever read
+    // from a peer that proved it holds the session key — never from an unauthenticated
+    // `hello` an attacker could forge.
+    opts.client.on("connected", (identity: HelperIdentity) => this.onConnected(identity));
     opts.client.on("helperUnreachable", () => void this.respawn("unreachable"));
   }
 
@@ -69,18 +66,18 @@ export class HelperManager {
     }
   }
 
-  private onConnected(hello: HelloMessage): void {
+  private onConnected(identity: HelperIdentity): void {
     this.connectedSince = Date.now();
     this.respawnExp = 0;
 
-    const staleProtocol = hello.protocolVersion !== PROTOCOL_VERSION;
+    // Protocol mismatches never reach here — helper-client refuses them pre-auth.
     const expected = this.expectedBuildId();
-    const staleBuild = expected !== null && hello.buildId !== expected;
-    if ((staleProtocol || staleBuild) && !this.swapping) {
+    const staleBuild = expected !== null && identity.buildId !== expected;
+    if (staleBuild && !this.swapping) {
       this.opts.logger.info(
-        `helper stale (${staleProtocol ? "protocol" : "buildId"}: have ${hello.buildId}, want ${expected}); swapping`,
+        `helper stale (buildId: have ${identity.buildId}, want ${expected}); swapping`,
       );
-      void this.swap(hello.pid);
+      void this.swap(identity.pid);
     }
   }
 

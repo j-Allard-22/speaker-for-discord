@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      # Build first — it emits packages/shared/dist that typecheck resolves against.
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Package
+        run: |
+          npm install -g @elgato/cli
+          node scripts/pack.mjs
+
+      # pack.mjs refuses to run if Nodejs.Debug is present; double-check the artifact
+      # contains no logs, caches, or secrets.
+      - name: Audit archive contents
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path *.streamDeckPlugin))
+          $bad = $zip.Entries | Where-Object { $_.FullName -match '\.log$|/logs/|/cache/|avatars/|auth\.json|session\.key' }
+          $zip.Entries | ForEach-Object { Write-Host $_.FullName }
+          $zip.Dispose()
+          if ($bad) { Write-Error "archive contains runtime/user data: $($bad.FullName -join ', ')"; exit 1 }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.streamDeckPlugin"
+          generate_release_notes: true

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    # The plugin is Windows-only (Discord IPC named pipes, %LOCALAPPDATA%), and the
+    # ws-auth integration tests bind real loopback sockets — run them on Windows.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # esbuild's platform binary (@esbuild/win32-x64) is a resolved optionalDependency
+      # in package-lock.json, so `npm ci` installs it whether or not npm 11 runs esbuild's
+      # (fallback) postinstall — the build does not depend on that script.
+      - run: npm ci
+
+      # Build first: it emits packages/shared/dist, which the helper/plugin typecheck
+      # resolves @dsd/shared against (its package.json points types at ./dist). On a
+      # clean checkout dist does not exist yet, so typecheck-before-build would fail.
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Validate Stream Deck manifest
+        run: |
+          npm install -g @elgato/cli
+          npm run validate
+
+      - name: Assert the release manifest has no debug port
+        shell: pwsh
+        run: |
+          $m = Get-Content packages/plugin/com.vitamin.speaker-for-discord.sdPlugin/manifest.json | ConvertFrom-Json
+          if ($null -ne $m.Nodejs.Debug) {
+            Write-Error "manifest.json ships Nodejs.Debug — it would open a Node --inspect port"
+            exit 1
+          }

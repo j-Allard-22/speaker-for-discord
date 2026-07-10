@@ -1,0 +1,7 @@
+<!-- Action-list icon: 20x20 nominal, monochrome, #FFFFFF foreground (Elgato guideline). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
+  <rect x="8.25" y="2" width="3.5" height="8" rx="1.75" fill="#FFFFFF"/>
+  <path d="M5 8.5 a5 5 0 0 0 10 0" stroke="#FFFFFF" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+  <line x1="10" y1="13.5" x2="10" y2="16" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="7" y1="17.5" x2="13" y2="17.5" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

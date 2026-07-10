@@ -9,10 +9,16 @@
  *          (consent modal in the Discord client, 120 s timeout) -> code -> token
  *          exchange -> AUTHENTICATE.
  *
+ * PKCE: every AUTHORIZE carries a `code_challenge` (S256) and every code exchange the
+ * matching `code_verifier`. When the user's app has the Public Client flag they need no
+ * client secret at all — then the secret exists nowhere: not in Stream Deck's settings,
+ * not on the localhost socket, not on disk. We send `client_secret` iff the user gave one.
+ *
  * Scope note: `rpc.voice.read` gates the voice events; the legacy docs' scope name
  * `rpc.notifications.read` is wrong. The token exchange must cite a redirect_uri
  * registered verbatim in the Dev Portal even though nothing listens on it.
  */
+import { createHash, randomBytes } from "node:crypto";
 import { DISCORD_SCOPES, REDIRECT_URI } from "@dsd/shared";
 import type { HelperLogger } from "../logger.js";
 import type { DiscordRpcClient } from "./rpc-client.js";
@@ -21,13 +27,30 @@ import type { StoredAuth, TokenStore } from "./token-store.js";
 const TOKEN_ENDPOINT = "https://discord.com/api/oauth2/token";
 const AUTHORIZE_TIMEOUT_MS = 120_000;
 
-/** Boot path hit the end of the silent ladder; user must act in the PI. */
+/**
+ * Boot path hit the end of the silent ladder; user must act in the PI.
+ * `hint` is surfaced in the property inspector when we can explain *why*.
+ */
 export class AuthNeededError extends Error {
-  constructor(readonly reason: "no_credentials" | "token_invalid") {
+  constructor(
+    readonly reason: "no_credentials" | "token_invalid",
+    readonly hint?: string,
+  ) {
     super(`authentication required: ${reason}`);
     this.name = "AuthNeededError";
   }
 }
+
+/**
+ * Verified against Discord 2026-07: an `authorization_code` exchange carrying a
+ * `code_verifier` succeeds with NO `client_secret` even when the app lacks the
+ * PUBLIC_OAUTH2_CLIENT flag — but the `refresh_token` grant then returns
+ * `401 invalid_client`. So a user who leaves the secret blank *without* enabling
+ * "Public Client" logs in fine and then silently loses the session a week later.
+ * We can't fix that for them, but we can say exactly what to do about it.
+ */
+export const PUBLIC_CLIENT_HINT =
+  "Token refresh needs either 'Public Client' enabled on your app's OAuth2 tab, or a Client Secret.";
 
 /** User denied the consent modal, or it timed out. */
 export class ConsentRequiredError extends Error {
@@ -48,6 +71,21 @@ export class TokenEndpointError extends Error {
   }
 }
 
+/**
+ * Discord rejected the authorization_code exchange. Almost always: the app has Public
+ * Client OFF and no secret was supplied. Non-recoverable and user-actionable — the code
+ * is single-use, so retrying is pointless (and was the source of a silent retry loop).
+ */
+export class OAuthExchangeError extends Error {
+  constructor(readonly detail: string) {
+    super(
+      "Discord rejected the token exchange. On your app's OAuth2 tab enable " +
+        "'Public Client' — or paste the Client Secret in the key settings.",
+    );
+    this.name = "OAuthExchangeError";
+  }
+}
+
 export interface AuthResult {
   user: { id?: string; username?: string };
   auth: StoredAuth;
@@ -61,6 +99,13 @@ export interface AuthDeps {
   fetchFn?: typeof fetch;
   now?: () => number;
   authorizeTimeoutMs?: number;
+}
+
+/** RFC 7636 S256: verifier is 43 base64url chars; challenge = base64url(sha256(verifier)). */
+export function createPkcePair(): { verifier: string; challenge: string } {
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
 }
 
 export async function ensureAuthenticated(
@@ -84,15 +129,17 @@ export async function ensureAuthenticated(
     }
   }
 
-  // 2. Refresh grant.
+  // 2. Refresh grant. A REJECTED refresh stays silent and falls through to the ladder's
+  //    end — the user gets a clean "Authorize" prompt, never a silent loop.
+  let hint: string | undefined;
   if (auth.refreshToken) {
     try {
       const tokens = await requestToken(
         {
           client_id: auth.clientId,
-          client_secret: auth.clientSecret,
           grant_type: "refresh_token",
           refresh_token: auth.refreshToken,
+          ...(auth.clientSecret ? { client_secret: auth.clientSecret } : {}),
         },
         deps,
       );
@@ -102,16 +149,26 @@ export async function ensureAuthenticated(
       return { user, auth };
     } catch (err) {
       if (err instanceof TokenEndpointError && err.kind === "network") throw err; // retryable
-      deps.logger.warn("refresh failed; tokens are dead", { message: String(err) });
+      // Discord rejects a secret-less refresh unless the app is a Public Client. Without
+      // this hint the user just sees "Authorize" reappear every week for no stated reason.
+      if (err instanceof TokenEndpointError && err.kind === "rejected" && !auth.clientSecret) {
+        hint = PUBLIC_CLIENT_HINT;
+      }
+      deps.logger.warn("refresh failed; tokens are dead", {
+        message: String(err),
+        ...(hint !== undefined && { hint }),
+      });
     }
   }
 
   // 3. Full AUTHORIZE — user-initiated only.
   if (!opts.allowConsentPrompt) {
-    throw new AuthNeededError("token_invalid");
+    throw new AuthNeededError("token_invalid", hint);
   }
 
-  deps.logger.info("running AUTHORIZE (consent modal in Discord)");
+  const { verifier, challenge } = createPkcePair();
+
+  deps.logger.info("running AUTHORIZE (consent modal in Discord)", { pkce: true });
   deps.onConsentPrompt?.();
   let code: string;
   try {
@@ -120,6 +177,8 @@ export async function ensureAuthenticated(
         client_id: auth.clientId,
         scopes: [...DISCORD_SCOPES],
         response_type: "code",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
       }),
       deps.authorizeTimeoutMs ?? AUTHORIZE_TIMEOUT_MS,
       "consent dialog timed out",
@@ -130,19 +189,30 @@ export async function ensureAuthenticated(
     throw new ConsentRequiredError(err instanceof Error ? err.message : String(err));
   }
 
-  const tokens = await requestToken(
-    {
-      client_id: auth.clientId,
-      client_secret: auth.clientSecret,
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: REDIRECT_URI,
-    },
-    deps,
-  );
+  let tokens: TokenResponse;
+  try {
+    tokens = await requestToken(
+      {
+        client_id: auth.clientId,
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+        ...(auth.clientSecret ? { client_secret: auth.clientSecret } : {}),
+      },
+      deps,
+    );
+  } catch (err) {
+    // A rejected code exchange is LOUD and terminal — the code is single-use.
+    if (err instanceof TokenEndpointError && err.kind === "rejected") {
+      throw new OAuthExchangeError(err.message);
+    }
+    throw err;
+  }
+
   auth = store.saveTokens(auth, tokens, now());
   const user = await authenticate(client, auth.accessToken!);
-  deps.logger.info("authenticated after full authorize");
+  deps.logger.info("authenticated after full authorize", { usedSecret: Boolean(auth.clientSecret) });
   return { user, auth };
 }
 
@@ -152,7 +222,7 @@ async function authenticate(
   client: DiscordRpcClient,
   accessToken: string,
 ): Promise<{ id?: string; username?: string }> {
-  // NOTE: never log the args of this command (logger redacts, but don't tempt fate).
+  // NOTE: never log the args of this command (the logger redacts, but don't tempt fate).
   const data = (await client.sendCommand("AUTHENTICATE", { access_token: accessToken })) as {
     user?: { id?: string; username?: string };
   };
@@ -180,7 +250,7 @@ async function requestToken(body: Record<string, string>, deps: AuthDeps): Promi
     throw new TokenEndpointError(`token endpoint unreachable: ${String(err)}`, "network");
   }
   if (!res.ok) {
-    // Body may contain error codes; safe to log status only.
+    // Body may name the OAuth error; status alone is safe to log.
     throw new TokenEndpointError(`token endpoint rejected grant (HTTP ${res.status})`, "rejected");
   }
   const json = (await res.json()) as TokenResponse;

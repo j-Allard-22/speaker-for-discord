@@ -75,7 +75,7 @@ export function deriveKey(s: SpeakerStoreState): DerivedKey {
   }
 }
 
-@action({ UUID: "com.joallard.discord-speaker.current-speaker" })
+@action({ UUID: "com.vitamin.speaker-for-discord.current-speaker" })
 export class CurrentSpeaker extends SingletonAction {
   private readonly lastSig = new Map<string, string>(); // action context id -> painted sig
   private readonly paintSeq = new Map<string, number>(); // stale async-paint guard

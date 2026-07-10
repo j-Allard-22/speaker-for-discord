@@ -1,68 +1,82 @@
-# Discord Speaker — Stream Deck plugin
+# Speaker for Discord — a Stream Deck plugin
 
 Shows **who is currently speaking** in your Discord voice channel on a Stream Deck key:
-big avatar, name in a bottom band, updating live as speakers change. Built on Discord's
-local RPC/IPC interface — no bot, no server, personal use.
+their avatar, their name, updating live as the conversation moves.
 
-> Xbox party chat was investigated and is **not** included: Windows exposes no API to
-> identify *which* gamertag is speaking (see [docs/research-report.md](docs/research-report.md)).
+No bot, no server, no telemetry. It talks to your local Discord desktop app and to
+nothing else.
 
-## How it works
+> Unofficial and not affiliated with Discord Inc. or Elgato/Corsair.
 
-```
-Stream Deck ──► plugin (key rendering)
-                  │ localhost WebSocket
-                  ▼
-               helper process (persists across plugin reloads)
-                  │ named pipe (Discord RPC, scopes: rpc + rpc.voice.read)
-                  ▼
-               Discord desktop app
-```
+## Install
 
-The helper owns the single Discord connection (Discord rate-limits RPC connects to ~2/min)
-and survives plugin restarts. Tokens are cached in `%LOCALAPPDATA%\DiscordSpeakerHelper\`
-— the consent dialog appears **once**.
+See **[docs/INSTALL.md](docs/INSTALL.md)** — about five minutes.
 
-## Setup
+Requirements: Windows 10/11, Stream Deck app **7.1+**, and the Discord **desktop** app.
+You do *not* need to install Node.js; Stream Deck ships its own runtime.
 
-1. Install the plugin (or `streamdeck link` the `.sdPlugin` folder for development).
-2. Drag **Current Speaker** onto a key → it shows *Setup*.
-3. Create your own Discord application (3 minutes, one time):
-   see [docs/discord-app-setup.md](docs/discord-app-setup.md) — also embedded in the
-   key's settings panel.
-4. Paste Client ID + Client Secret into the key settings → approve Discord's
-   authorization dialog once → done.
-
-**Don't set a custom image on the key** — Stream Deck would permanently cover the live
-avatar with it.
+Because Discord gates the `rpc.voice.read` scope behind approval, each user registers
+their own (free, private, 3-minute) Discord application:
+**[docs/discord-app-setup.md](docs/discord-app-setup.md)**. Enable *Public Client* there
+and the plugin uses PKCE — **no client secret is ever stored anywhere**.
 
 ## Key states
 
 | Key shows | Meaning |
 |---|---|
-| avatar + name | that person is talking |
-| dim mic | in a voice channel, nobody talking |
-| `No VC` | connected, but you're not in a voice channel |
-| `Discord?` | Discord desktop app isn't running |
-| `Setup` | client ID/secret not configured yet |
-| `Authorize` | press *Re-authorize* in key settings, then approve in Discord |
-| `Check Discord` | consent dialog is open in the Discord app |
+| avatar + name | that person is speaking |
+| dim microphone | in a voice channel, nobody talking |
+| `Connecting…` | contacting the helper / Discord (momentary, on first load) |
+| `No VC` | connected, but not in a voice channel |
+| `Discord?` | the Discord desktop app isn't running |
+| `Setup` | no Client ID configured yet |
+| `Check Discord` | the authorization dialog is open in Discord |
+| `Authorize` | press *Re-authorize* in the key settings |
 | red `!` | helper process down (auto-recovers) |
-| `Port conflict` | another app owns port 39642 — change *Helper port* in key settings |
+| `Port conflict` | another program owns port 39642 — change *Helper port* |
+
+**Don't set a custom image on the key** — it would permanently cover the live avatar.
+
+## How it works
+
+```
+Stream Deck ──► plugin (renders the key)
+                  │ authenticated WebSocket on 127.0.0.1
+                  ▼
+               helper process (persists across plugin reloads)
+                  │ named pipe — Discord RPC, scope rpc.voice.read
+                  ▼
+               Discord desktop app
+```
+
+The helper owns the single Discord connection, because Discord rate-limits RPC connects
+to about two per minute and the plugin restarts often. The localhost link between them is
+**mutually authenticated** with a per-machine key, so neither a web page you visit nor
+another user on the PC can read your voice-channel roster or impersonate the helper —
+see **[SECURITY.md](SECURITY.md)**.
+
+## Privacy
+
+Everything stays on your computer. The plugin's only outbound requests are Discord's
+token endpoint and its avatar CDN. Full details, and how to delete your data:
+**[PRIVACY.md](PRIVACY.md)**. To erase credentials, press **Forget credentials** in the
+key settings.
 
 ## Development
 
+**[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** — setup, the two-process architecture, the
+dev loop, and the gotchas worth knowing before you touch the Discord RPC layer.
+
 ```powershell
-npm install               # once (Node 24+)
-npm run build             # shared -> helper -> plugin
-npm run watch             # dev loop; plugin hot-reloads, helper persists
-npm run test              # vitest unit suite
-npm run helper:probe      # watch the helper's live message stream
-npm run helper:restart    # cycle the helper (picks up a fresh helper build)
-npm run validate          # manifest/bundle validation
-node scripts/pack.mjs     # release .streamDeckPlugin (strips the dev Debug flag)
+npm ci && npm run build && npm test
 ```
 
-Architecture details and hard-won constraints: [CLAUDE.md](CLAUDE.md).
-Tokens/logs/avatar cache live in `%LOCALAPPDATA%\DiscordSpeakerHelper\`, never inside
-the plugin folder.
+## Why not Xbox party chat?
+
+It was researched thoroughly and it isn't possible: Windows exposes no API that says
+*which* gamertag is speaking, and party audio reaches the PC as a single mixed stream.
+The full findings are in [docs/research-report.md](docs/research-report.md).
+
+## License
+
+[MIT](LICENSE). Third-party notices: [THIRD-PARTY.md](THIRD-PARTY.md).

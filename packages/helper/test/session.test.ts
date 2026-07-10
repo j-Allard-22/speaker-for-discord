@@ -56,23 +56,34 @@ class ScriptedClient extends EventEmitter {
   }
 }
 
-function makeSession(client: ScriptedClient) {
+/** A client whose connect() never settles — parks the session loop for assertions. */
+function stalledClient(): ScriptedClient {
+  const c = new ScriptedClient(() => ({}));
+  c.connect = () => new Promise<Record<string, unknown>>(() => undefined);
+  return c;
+}
+
+function makeSession(client: ScriptedClient, clientFactory?: () => ScriptedClient) {
   const store = new TokenStore(mkdtempSync(join(tmpdir(), "dsd-session-")));
   store.save({ clientId: "app", clientSecret: "s", accessToken: "at", expiresAt: Date.now() + 1e9 });
   const tracker = new SpeakerTracker({ switchDebounceMs: 0, idleHoldMs: 0 });
   const logger = new HelperLogger({
     dir: mkdtempSync(join(tmpdir(), "dsd-session-log-")),
     mirrorToConsole: false,
+    minLevel: "error",
   });
+  const sleeps: number[] = [];
   const session = new DiscordSession({
     store,
     tracker,
     logger,
-    clientFactory: () => client as unknown as DiscordRpcClient,
+    clientFactory: () => (clientFactory ? clientFactory() : client) as unknown as DiscordRpcClient,
     authFn: async () => ({ user: { id: "me" }, auth: store.load()! }),
-    sleepFn: async () => undefined,
+    sleepFn: async (ms: number) => {
+      sleeps.push(ms);
+    },
   });
-  return { session, tracker, store };
+  return { session, tracker, store, sleeps };
 }
 
 describe("DiscordSession bootstrap", () => {
@@ -175,6 +186,29 @@ describe("DiscordSession bootstrap", () => {
       expect(session.channel.channelName).toBe("NEW");
       expect(tracker.memberList.map((m) => m.userId)).toEqual(["NEW"]);
     });
+    session.stop();
+  });
+
+  it("S7 regression: a healthy session that ends backs off before reconnecting", async () => {
+    // Discord accepting the handshake then dropping the pipe (restart/flap) used to
+    // reconnect in a tight loop, burning its ~2 connections/min budget.
+    const live = new ScriptedClient((cmd, _args, evt) => {
+      if (cmd === "SUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: null };
+      throw new Error(`unexpected ${cmd}`);
+    });
+    let calls = 0;
+    // Second dial never settles, so the loop parks and `sleeps` stays deterministic.
+    const { session, sleeps } = makeSession(live, () => (++calls === 1 ? live : stalledClient()));
+
+    session.startFromStored();
+    await vi.waitFor(() => expect(session.status.discord).toBe("no_channel"));
+    expect(sleeps).toHaveLength(0); // no backoff on the happy path
+
+    live.close(); // Discord goes away mid-session
+    await vi.waitFor(() => expect(sleeps.length).toBeGreaterThan(0));
+    expect(sleeps[0]).toBeGreaterThan(0); // slept before dialing again
+    expect(calls).toBe(2); // exactly one reconnect attempt, after the sleep
     session.stop();
   });
 

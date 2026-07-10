@@ -23,6 +23,7 @@ import type { RawVoiceState, SpeakerTracker } from "../speaker-tracker.js";
 import {
   AuthNeededError,
   ConsentRequiredError,
+  OAuthExchangeError,
   TokenEndpointError,
   ensureAuthenticated,
 } from "./auth.js";
@@ -104,12 +105,28 @@ export class DiscordSession extends EventEmitter {
    * - changed credentials: restart; consent allowed only when the change came from
    *   an explicit user action in the PI.
    */
-  setCredentials(clientId: string, clientSecret: string, userInitiated: boolean): void {
+  setCredentials(clientId: string, clientSecret: string | undefined, userInitiated: boolean): void {
+    // "" and undefined are the same thing (no secret) — otherwise a blank secret would
+    // look like a change on every reconnect and restart the session in a loop.
+    const secret = clientSecret ? clientSecret : undefined;
     const before = this.deps.store.load();
-    const changed = !before || before.clientId !== clientId || before.clientSecret !== clientSecret;
-    this.deps.store.applyCredentials(clientId, clientSecret);
+    const changed = !before || before.clientId !== clientId || before.clientSecret !== secret;
+    this.deps.store.applyCredentials(clientId, secret);
     if (this.running && !changed) return;
     this.restart(changed && userInitiated);
+  }
+
+  /** User pressed "Forget credentials": wipe credentials AND tokens, park. */
+  forgetCredentials(): void {
+    this.stopped = true;
+    this.wakeSleep?.();
+    this.client?.close();
+    this.client = null;
+    this.deps.store.clear();
+    this.deps.tracker.clear();
+    this.setChannel({ channelId: null, guildId: null, channelName: null });
+    this.setStatus("awaiting_credentials");
+    this.emit("authRequired", "no_credentials");
   }
 
   /** User pressed Re-authorize: wipe tokens, full AUTHORIZE (consent modal allowed). */
@@ -126,7 +143,10 @@ export class DiscordSession extends EventEmitter {
       this.emit("authRequired", "no_credentials");
       return;
     }
-    this.deps.store.save({ clientId: auth.clientId, clientSecret: auth.clientSecret });
+    this.deps.store.save({
+      clientId: auth.clientId,
+      ...(auth.clientSecret ? { clientSecret: auth.clientSecret } : {}),
+    });
     this.restart(true);
   }
 
@@ -218,6 +238,10 @@ export class DiscordSession extends EventEmitter {
         this.deps.tracker.clear();
         this.setChannel({ channelId: null, guildId: null, channelName: null });
         this.setStatus("disconnected", "Discord connection lost");
+        // MUST back off here. A Discord that accepts the handshake and then immediately
+        // drops the pipe (restart/flap) would otherwise reconnect in a tight loop, each
+        // iteration burning one of Discord's ~2 connections/min.
+        if (!this.stopped) await this.backoff(true);
         continue;
       } catch (err) {
         client.close();
@@ -232,7 +256,12 @@ export class DiscordSession extends EventEmitter {
 
         if (err instanceof AuthNeededError) {
           this.deps.logger.info("parking: auth needed", { reason: err.reason });
-          this.setStatus(err.reason === "no_credentials" ? "awaiting_credentials" : "disconnected");
+          // `hint` explains WHY when we know (e.g. a secret-less refresh needs Public
+          // Client); it reaches the property inspector as the status detail.
+          this.setStatus(
+            err.reason === "no_credentials" ? "awaiting_credentials" : "disconnected",
+            err.hint,
+          );
           this.emit("authRequired", err.reason);
           if (parkOrContinue() === "continue") continue;
           break; // park AWAITING_USER
@@ -244,6 +273,15 @@ export class DiscordSession extends EventEmitter {
           if (parkOrContinue() === "continue") continue;
           break; // park — no retry spam, no unprompted modal
         }
+        if (err instanceof OAuthExchangeError) {
+          // Public Client is OFF and no secret was given. The authorization code is
+          // single-use, so retrying is pointless — surface it loudly and park.
+          this.deps.logger.error("parking: token exchange rejected", { detail: err.detail });
+          this.setStatus("disconnected", err.message);
+          this.emit("fatal", err.message, "oauth_exchange_failed");
+          if (parkOrContinue() === "continue") continue;
+          break;
+        }
         if (err instanceof NoDiscordError) {
           this.setStatus("disconnected", "Discord is not running");
           await this.backoff(false);
@@ -253,6 +291,9 @@ export class DiscordSession extends EventEmitter {
           // Discord ANSWERED with a close/error frame — bad client id or similar.
           // (READY timeouts are NOT rejections: they're rate limiting or a wedged
           // pipe, and go down the generic retry path below.)
+          // Discord answering AT ALL consumed a server connection, so stamp the clock:
+          // otherwise the >=31 s min-gap computes against 0 and is inert.
+          this.lastServerConnectAt = this.deps.now?.() ?? Date.now();
           this.handshakeRejections++;
           this.deps.logger.warn("handshake rejected by Discord", {
             message: err.message,
@@ -485,7 +526,9 @@ export class DiscordSession extends EventEmitter {
   private setStatus(s: DiscordStatus, detail?: string): void {
     if (s !== this.lastStatus || detail !== this.lastDetail) {
       // Every transition is logged — silent failure paths made live debugging blind.
-      this.deps.logger.info("status", { discord: s, ...(detail !== undefined && { detail }) });
+      // `detail` can carry the user's channel name, so it only appears at debug level.
+      this.deps.logger.info("status", { discord: s });
+      if (detail !== undefined) this.deps.logger.debug("status detail", { discord: s, detail });
     }
     this.lastStatus = s;
     this.lastDetail = detail;

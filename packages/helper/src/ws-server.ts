@@ -1,21 +1,41 @@
 /**
  * Localhost WS server for the plugin.
  *
- * - Port binding IS the single-instance lock. On EADDRINUSE we retry for ~5 s
- *   (250 ms interval) before concluding a healthy incumbent owns the port and
- *   exiting 0 — a just-shutdown predecessor frees the port within that window
- *   (fixes the upgrade respawn race).
- * - Snapshot-on-connect: every new client gets hello -> status -> channel -> speaker.
- * - Heartbeat: WE ping each client every 15 s (isAlive/pong pattern) and terminate
- *   after 2 missed rounds. The plugin needs no ping of its own.
+ * THREAT MODEL: 127.0.0.1 is reachable by any web page the user visits (browsers open
+ * ws:// cross-origin with no CORS preflight) and by any local process, including one
+ * running as a different non-admin user. Therefore:
+ *
+ *  - Nothing is disclosed before the peer proves it holds the session key. `hello`
+ *    carries only a nonce and the protocol version — not even the helper's pid.
+ *  - The server proves possession FIRST (bound to the client's fresh nonce), so a
+ *    port-squatter can never coax the plugin into sending Discord credentials.
+ *  - `Origin` is rejected at the upgrade: browsers always send it, the `ws` client
+ *    never does. Necessary but NOT sufficient (a native process sends none) — the
+ *    HMAC handshake is the load-bearing control.
+ *  - maxPayload, a client cap, and an unauthenticated-socket timeout bound the DoS.
+ *
+ * Port binding IS the single-instance lock. On EADDRINUSE we retry for ~5 s so a
+ * just-shutdown predecessor can free the port (fixes the upgrade respawn race).
  */
+import type { IncomingMessage } from "node:http";
 import { EventEmitter } from "node:events";
 import type { AddressInfo } from "node:net";
 import {
+  HANDSHAKE_TIMEOUT_MS,
+  MAX_CLIENTS,
+  MAX_PAYLOAD_BYTES,
   PROTOCOL_VERSION,
+  isValidNonce,
+  parseHandshakeClientMessage,
   parsePluginMessage,
+  sessionNonce,
+  sessionProof,
+  verifySessionProof,
+  type HelloMessage,
   type HelperToPluginMessage,
   type PluginToHelperMessage,
+  type ServerAuthMessage,
+  type WelcomeMessage,
 } from "@dsd/shared";
 import { WebSocket, WebSocketServer } from "ws";
 import type { HelperLogger } from "./logger.js";
@@ -27,6 +47,11 @@ const BIND_RETRY_INTERVAL_MS = 250;
 interface TrackedClient extends WebSocket {
   isAlive?: boolean;
   missedPongs?: number;
+  /** Set only after the client's proof verifies. Ungated sockets receive nothing. */
+  authed?: boolean;
+  serverNonce?: string;
+  clientNonce?: string;
+  handshakeTimer?: NodeJS.Timeout;
 }
 
 export class PortOwnedError extends Error {
@@ -41,13 +66,24 @@ export interface HelperServerOptions {
   helperVersion: string;
   buildId: string;
   logger: HelperLogger;
-  /** Returns the current snapshot messages (status, channel, speaker) in send order. */
+  /** Shared per-machine secret; see @dsd/shared session-key.ts. */
+  sessionKey: Buffer;
+  /** Current snapshot messages (status, channel, speaker, [authRequired]) in send order. */
   snapshot: () => HelperToPluginMessage[];
+}
+
+/** Browsers always send Origin on a WS upgrade; our `ws` client never does. */
+function rejectsUpgrade(req: IncomingMessage, port: number): boolean {
+  if (req.headers.origin !== undefined) return true;
+  const host = req.headers.host;
+  if (host === undefined) return false;
+  return host !== `127.0.0.1:${port}` && host !== `localhost:${port}`;
 }
 
 /**
  * Events:
  * - "message" (msg: PluginToHelperMessage, reply: (m: HelperToPluginMessage) => void)
+ *   — emitted ONLY for authenticated clients.
  * - "clientsChanged" (count: number)
  */
 export class HelperServer extends EventEmitter {
@@ -59,15 +95,16 @@ export class HelperServer extends EventEmitter {
     super();
   }
 
+  /** Sockets that completed the handshake. Orphan-watch counts only these. */
   get clientCount(): number {
-    return this.wss?.clients.size ?? 0;
+    let n = 0;
+    for (const c of (this.wss?.clients ?? []) as Set<TrackedClient>) if (c.authed) n++;
+    return n;
   }
 
-  /** Bind with retry window; rejects PortOwnedError if an incumbent keeps the port. */
   async start(): Promise<number> {
     const deadline = Date.now() + BIND_RETRY_WINDOW_MS;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
+    for (;;) {
       try {
         this.wss = await this.tryBind();
         break;
@@ -88,17 +125,21 @@ export class HelperServer extends EventEmitter {
     return port;
   }
 
+  /** Broadcast reaches AUTHENTICATED clients only — a mid-handshake socket gets nothing. */
   broadcast(msg: HelperToPluginMessage): void {
     const raw = JSON.stringify(msg);
-    for (const client of this.wss?.clients ?? []) {
-      if (client.readyState === WebSocket.OPEN) client.send(raw);
+    for (const client of (this.wss?.clients ?? []) as Set<TrackedClient>) {
+      if (client.authed && client.readyState === WebSocket.OPEN) client.send(raw);
     }
   }
 
   close(): void {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = null;
-    for (const client of this.wss?.clients ?? []) client.terminate();
+    for (const client of (this.wss?.clients ?? []) as Set<TrackedClient>) {
+      if (client.handshakeTimer) clearTimeout(client.handshakeTimer);
+      client.terminate();
+    }
     this.wss?.close();
     this.wss = null;
   }
@@ -107,7 +148,12 @@ export class HelperServer extends EventEmitter {
 
   private tryBind(): Promise<WebSocketServer> {
     return new Promise((resolve, reject) => {
-      const wss = new WebSocketServer({ host: "127.0.0.1", port: this.opts.port });
+      const wss = new WebSocketServer({
+        host: "127.0.0.1",
+        port: this.opts.port,
+        maxPayload: MAX_PAYLOAD_BYTES,
+        verifyClient: (info: { req: IncomingMessage }) => !rejectsUpgrade(info.req, this.opts.port),
+      });
       const onError = (err: Error): void => {
         wss.close();
         reject(err);
@@ -115,7 +161,6 @@ export class HelperServer extends EventEmitter {
       wss.once("error", onError);
       wss.once("listening", () => {
         wss.removeListener("error", onError);
-        // Post-bind errors shouldn't crash the helper.
         wss.on("error", (err) => this.opts.logger.error("ws server error", { message: err.message }));
         resolve(wss);
       });
@@ -123,43 +168,129 @@ export class HelperServer extends EventEmitter {
   }
 
   private onConnection(ws: TrackedClient): void {
-    this.lastClientSeenAt = Date.now();
+    // A socket-level protocol error (oversized frame, malformed masking) emits "error".
+    // Without this listener Node turns it into an uncaughtException and the helper
+    // exits(1) — i.e. any peer could crash it by sending one > maxPayload frame. This
+    // MUST be attached before any early return: a socket refused by the client cap can
+    // still be mid-CLOSING when its oversized frame lands, so it needs the listener too.
+    ws.on("error", (err) => {
+      this.opts.logger.warn("client socket error; terminating", { message: err.message });
+      ws.terminate();
+    });
+
+    if ((this.wss?.clients.size ?? 0) > MAX_CLIENTS) {
+      this.opts.logger.warn("client cap reached; refusing connection");
+      ws.close(1013, "too many clients");
+      return;
+    }
+
     ws.isAlive = true;
     ws.missedPongs = 0;
+    ws.authed = false;
+    ws.serverNonce = sessionNonce();
+
     ws.on("pong", () => {
       ws.isAlive = true;
       ws.missedPongs = 0;
-      this.lastClientSeenAt = Date.now();
+      if (ws.authed) this.lastClientSeenAt = Date.now();
     });
 
-    // Snapshot-on-connect (this is what makes willAppear-after-restart irrelevant):
-    const hello: HelperToPluginMessage = {
+    // A peer that never completes the handshake is dropped — no lingering listeners.
+    ws.handshakeTimer = setTimeout(() => {
+      if (!ws.authed) {
+        this.opts.logger.warn("handshake timeout; terminating peer");
+        ws.terminate();
+      }
+    }, HANDSHAKE_TIMEOUT_MS);
+
+    const hello: HelloMessage = {
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
+      serverNonce: ws.serverNonce,
+    };
+    ws.send(JSON.stringify(hello));
+
+    ws.on("message", (raw) => this.onMessage(ws, raw.toString()));
+
+    ws.on("close", () => {
+      if (ws.handshakeTimer) clearTimeout(ws.handshakeTimer);
+      if (ws.authed) {
+        this.lastClientSeenAt = Date.now();
+        this.emit("clientsChanged", this.clientCount);
+      }
+    });
+  }
+
+  private onMessage(ws: TrackedClient, raw: string): void {
+    if (!ws.authed) {
+      this.onHandshakeMessage(ws, raw);
+      return;
+    }
+    this.lastClientSeenAt = Date.now();
+    const msg: PluginToHelperMessage | null = parsePluginMessage(raw);
+    if (!msg) {
+      this.opts.logger.warn("unparseable client message dropped");
+      return;
+    }
+    this.emit("message", msg, (reply: HelperToPluginMessage) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(reply));
+    });
+  }
+
+  /** Pre-auth frames go through the NARROW parser — no app message can slip in here. */
+  private onHandshakeMessage(ws: TrackedClient, raw: string): void {
+    const msg = parseHandshakeClientMessage(raw);
+    if (!msg) {
+      this.opts.logger.warn("bad handshake frame; terminating peer");
+      ws.terminate();
+      return;
+    }
+
+    if (msg.type === "clientChallenge") {
+      if (ws.clientNonce !== undefined || !isValidNonce(msg.clientNonce)) {
+        ws.terminate();
+        return;
+      }
+      ws.clientNonce = msg.clientNonce;
+      const serverAuth: ServerAuthMessage = {
+        type: "serverAuth",
+        serverProof: sessionProof(this.opts.sessionKey, "S", ws.serverNonce!, ws.clientNonce),
+      };
+      ws.send(JSON.stringify(serverAuth));
+      return;
+    }
+
+    // clientAuth
+    if (ws.clientNonce === undefined) {
+      ws.terminate(); // out of order
+      return;
+    }
+    const ok = verifySessionProof(
+      this.opts.sessionKey,
+      "C",
+      ws.serverNonce!,
+      ws.clientNonce,
+      msg.clientProof,
+    );
+    if (!ok) {
+      this.opts.logger.warn("client failed authentication; terminating peer");
+      ws.terminate();
+      return;
+    }
+
+    if (ws.handshakeTimer) clearTimeout(ws.handshakeTimer);
+    ws.authed = true;
+    this.lastClientSeenAt = Date.now();
+    this.opts.logger.info("client authenticated");
+
+    const welcome: WelcomeMessage = {
+      type: "welcome",
       helperVersion: this.opts.helperVersion,
       buildId: this.opts.buildId,
       pid: process.pid,
     };
-    ws.send(JSON.stringify(hello));
-    for (const msg of this.opts.snapshot()) ws.send(JSON.stringify(msg));
-
-    ws.on("message", (raw) => {
-      this.lastClientSeenAt = Date.now();
-      const msg: PluginToHelperMessage | null = parsePluginMessage(raw.toString());
-      if (!msg) {
-        this.opts.logger.warn("unparseable client message dropped");
-        return;
-      }
-      this.emit("message", msg, (reply: HelperToPluginMessage) => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(reply));
-      });
-    });
-
-    ws.on("close", () => {
-      this.lastClientSeenAt = Date.now();
-      this.emit("clientsChanged", this.clientCount);
-    });
-
+    ws.send(JSON.stringify(welcome));
+    for (const m of this.opts.snapshot()) ws.send(JSON.stringify(m));
     this.emit("clientsChanged", this.clientCount);
   }
 

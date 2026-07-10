@@ -4,8 +4,8 @@ dist/
 *.tsbuildinfo
 
 # build outputs inside the plugin bundle
-packages/plugin/com.joallard.discord-speaker.sdPlugin/bin/
-packages/plugin/com.joallard.discord-speaker.sdPlugin/logs/
+packages/plugin/com.vitamin.speaker-for-discord.sdPlugin/bin/
+packages/plugin/com.vitamin.speaker-for-discord.sdPlugin/logs/
 
 # packaged plugin
 *.streamDeckPlugin
@@ -13,5 +13,11 @@ packages/plugin/com.joallard.discord-speaker.sdPlugin/logs/
 # local secrets must never land here, but belt-and-braces
 .env
 .env.*
+auth.json
+session.key
 
 .claude/
+logs/
+
+# NOTE: docs/ is intentionally NOT ignored — INSTALL.md / DEVELOPMENT.md / PRIVACY.md
+# are part of the published repo and are linked from README.md.
