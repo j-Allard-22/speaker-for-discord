@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { camelToSnake, normalizeKeys } from "../src/discord/normalize";
+import {
+  MAX_NORMALIZE_DEPTH,
+  NormalizeError,
+  camelToSnake,
+  normalizeKeys,
+} from "../src/discord/normalize";
 
 describe("normalizeKeys", () => {
   it("converts camelCase keys to snake_case recursively", () => {
@@ -39,5 +44,24 @@ describe("normalizeKeys", () => {
     expect(camelToSnake("expiresIn")).toBe("expires_in");
     expect(camelToSnake("already_snake")).toBe("already_snake");
     expect(camelToSnake("v2Endpoint")).toBe("v2_endpoint");
+  });
+
+  it("throws (rather than stack-overflowing) on a hostile deeply-nested payload", () => {
+    // Build nesting past the cap. A stack overflow here would escape as an
+    // uncaughtException and kill the helper; a thrown NormalizeError is caught upstream.
+    let deep: unknown = 1;
+    for (let i = 0; i < MAX_NORMALIZE_DEPTH + 20; i++) deep = { next: deep };
+    expect(() => normalizeKeys(deep)).toThrowError(NormalizeError);
+    // A normal shallow payload is unaffected.
+    expect(() => normalizeKeys({ a: { b: { c: 1 } } })).not.toThrow();
+  });
+
+  it("does not let an incoming __proto__ key pollute the prototype", () => {
+    const result = normalizeKeys(JSON.parse('{"__proto__": {"polluted": true}}')) as Record<
+      string,
+      unknown
+    >;
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(result, "__proto__")).toBe(true);
   });
 });

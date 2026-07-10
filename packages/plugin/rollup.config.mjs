@@ -5,7 +5,7 @@ import path from "node:path";
 import url from "node:url";
 
 const isWatching = !!process.env.ROLLUP_WATCH;
-const sdPlugin = "com.joallard.discord-speaker.sdPlugin";
+const sdPlugin = "com.vitamin.speaker-for-discord.sdPlugin";
 
 /**
  * @type {import('rollup').RollupOptions}

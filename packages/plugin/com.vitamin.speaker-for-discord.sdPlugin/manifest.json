@@ -1,13 +1,14 @@
 {
   "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
-  "UUID": "com.joallard.discord-speaker",
-  "Name": "Discord Speaker",
-  "Version": "0.1.0.0",
-  "Author": "Jo Allard",
+  "UUID": "com.vitamin.speaker-for-discord",
+  "Name": "Speaker for Discord",
+  "Version": "1.0.0.0",
+  "Author": "Vitamin",
   "Description": "Shows the currently-speaking member of your Discord voice channel on a key: avatar and name, live.",
+  "URL": "https://github.com/j-Allard-22/speaker-for-discord",
   "CodePath": "bin/plugin.js",
   "Icon": "imgs/plugin/marketplace",
-  "Category": "Discord Speaker",
+  "Category": "Speaker for Discord",
   "CategoryIcon": "imgs/plugin/category-icon",
   "SDKVersion": 2,
   "Software": {
@@ -20,17 +21,18 @@
     }
   ],
   "Nodejs": {
-    "Version": "24",
-    "Debug": "enabled"
+    "Version": "24"
   },
   "Actions": [
     {
-      "UUID": "com.joallard.discord-speaker.current-speaker",
+      "UUID": "com.vitamin.speaker-for-discord.current-speaker",
       "Name": "Current Speaker",
       "Icon": "imgs/actions/current-speaker/icon",
       "Tooltip": "Shows who is currently speaking in your Discord voice channel.",
       "PropertyInspectorPath": "ui/settings.html",
-      "Controllers": ["Keypad"],
+      "Controllers": [
+        "Keypad"
+      ],
       "UserTitleEnabled": false,
       "States": [
         {

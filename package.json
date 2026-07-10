@@ -1,7 +1,17 @@
 {
-  "name": "streamdeck-discord-speaker",
+  "name": "speaker-for-discord",
+  "version": "1.0.0",
+  "description": "Stream Deck plugin showing the currently-speaking member of your Discord voice channel.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/j-Allard-22/speaker-for-discord.git"
+  },
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "workspaces": [
     "packages/*"
   ],
@@ -10,10 +20,11 @@
     "watch": "concurrently -k \"npm:watch:helper\" \"npm:watch:plugin\"",
     "watch:helper": "npm run watch -w @dsd/helper",
     "watch:plugin": "npm run watch -w @dsd/plugin",
+    "typecheck": "tsc -p packages/shared/tsconfig.json --noEmit && tsc -p packages/helper/tsconfig.json --noEmit && tsc -p packages/plugin/tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "helper:probe": "node packages/helper/scripts/ws-probe.mjs",
     "helper:restart": "node packages/helper/scripts/ws-probe.mjs --shutdown",
-    "validate": "streamdeck validate packages/plugin/com.joallard.discord-speaker.sdPlugin"
+    "validate": "streamdeck validate packages/plugin/com.vitamin.speaker-for-discord.sdPlugin"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

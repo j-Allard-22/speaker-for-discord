@@ -32,7 +32,7 @@ const cells: Array<[string, string]> = [
   ["no channel", NO_CHANNEL_KEY],
   ["helper down", HELPER_DOWN_KEY],
   ["port conflict", PORT_CONFLICT_KEY],
-  ["speaker (avatar)", renderSpeakerKey("Jo Allard", RED_PX)],
+  ["speaker (avatar)", renderSpeakerKey("Ada L.", RED_PX)],
   ["speaker (initials)", renderInitialsKey("Bartholomew III", "987654321")],
   ["speaker (emoji)", renderInitialsKey("👨‍👩‍👧‍👦 Fam", "123")],
 ];

@@ -1,0 +1,17 @@
+{
+  // Tests are executed by vitest (bundler-style resolution, no file extensions in
+  // relative imports), so they need their own config — the packages' NodeNext configs
+  // would demand `.js` suffixes. Included in `npm run typecheck` so test code is
+  // type-checked too, not just transpiled.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "types": ["node", "vitest/globals"],
+    "paths": {
+      "@dsd/shared": ["./packages/shared/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/test/**/*.ts", "vitest.config.ts"]
+}

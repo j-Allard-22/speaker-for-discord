@@ -39,6 +39,39 @@ describe("TokenStore", () => {
     expect(kept.clientSecret).toBe("s2");
   });
 
+  it("PUBLIC CLIENT: accepts a record with no clientSecret", () => {
+    const { store } = freshStore();
+    store.save({ clientId: "app", accessToken: "at" });
+    expect(store.load()).toEqual({ clientId: "app", accessToken: "at" });
+  });
+
+  it("dropping the secret for the same app keeps the tokens (tokens belong to the app)", () => {
+    const { store } = freshStore();
+    store.save({ clientId: "app", clientSecret: "s", accessToken: "at", refreshToken: "rt" });
+    const updated = store.applyCredentials("app"); // user enabled Public Client, cleared secret
+    expect(updated.clientSecret).toBeUndefined();
+    expect(updated.accessToken).toBe("at");
+    expect(updated.refreshToken).toBe("rt");
+    expect(store.load()?.clientSecret).toBeUndefined();
+  });
+
+  it("adding a secret later for the same app also keeps the tokens", () => {
+    const { store } = freshStore();
+    store.save({ clientId: "app", accessToken: "at", refreshToken: "rt" });
+    const updated = store.applyCredentials("app", "s");
+    expect(updated.clientSecret).toBe("s");
+    expect(updated.accessToken).toBe("at");
+  });
+
+  it("drops a non-string secret rather than discarding the whole record", () => {
+    const { store, dir } = freshStore();
+    writeFileSync(join(dir, "auth.json"), JSON.stringify({ clientId: "app", clientSecret: 42, accessToken: "at" }));
+    const loaded = store.load();
+    expect(loaded?.clientId).toBe("app");
+    expect(loaded?.accessToken).toBe("at");
+    expect(loaded?.clientSecret).toBeUndefined();
+  });
+
   it("rotates the refresh token, keeping the old one if the response omits it", () => {
     const { store } = freshStore();
     const base = store.applyCredentials("app", "s");

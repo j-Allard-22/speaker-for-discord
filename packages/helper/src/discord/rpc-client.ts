@@ -106,7 +106,16 @@ export class DiscordRpcClient extends EventEmitter {
       };
 
       const onFrame = (op: number, rawPayload: unknown): void => {
-        const payload = normalizeKeys(rawPayload) as Record<string, unknown>;
+        let payload: Record<string, unknown>;
+        try {
+          payload = normalizeKeys(rawPayload) as Record<string, unknown>;
+        } catch (err) {
+          const e = err instanceof Error ? err : new Error(String(err));
+          cleanup();
+          this.teardown(e);
+          reject(e);
+          return;
+        }
         if (op === Opcode.PING) {
           this.send(Opcode.PONG, payload);
           return;
@@ -186,7 +195,15 @@ export class DiscordRpcClient extends EventEmitter {
   // ---- internals ----
 
   private onFrame(op: number, rawPayload: unknown): void {
-    const payload = normalizeKeys(rawPayload) as Record<string, unknown>;
+    let payload: Record<string, unknown>;
+    try {
+      payload = normalizeKeys(rawPayload) as Record<string, unknown>;
+    } catch (err) {
+      // A hostile/oversized payload structure — disconnect rather than crash.
+      this.opts.logger?.warn("dropping malformed frame", { message: String(err) });
+      this.teardown(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
     if (op === Opcode.PING) {
       this.send(Opcode.PONG, payload);
       return;

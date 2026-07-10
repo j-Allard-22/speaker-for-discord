@@ -1,35 +1,52 @@
 /**
  * Reconnecting WS client to the helper + the SpeakerStore the actions render from.
  *
- * Hello-gate: NOTHING is sent (especially setCredentials with the client secret)
- * until a valid `hello` with a matching protocolVersion arrives. A socket that
- * connects but sends no hello within 3 s is a foreign process squatting the port.
+ * MUTUAL AUTH (see @dsd/shared session-key.ts). The plugin verifies the SERVER's proof
+ * before sending anything at all — so a process squatting the helper's port can never
+ * coax it into disclosing the user's Discord credentials. It then proves possession in
+ * turn, and only afterwards does the helper release any Discord state.
  *
- * Reconnect: 500 ms -> x2 -> cap 5 s, forever. After 3 consecutive failures the
- * manager is asked to respawn the helper (event "helperUnreachable").
+ *   S->C hello{serverNonce}  C->S clientChallenge{clientNonce}
+ *   S->C serverAuth{proof}   [verify or terminate]   C->S clientAuth{proof}
+ *   S->C welcome{...}        -> gate open
+ *
+ * Reconnect: 500 ms -> x2 -> cap 5 s, forever. After 3 consecutive failures the manager
+ * is asked to respawn the helper (event "helperUnreachable").
  */
 import { EventEmitter } from "node:events";
 import {
   DEFAULT_HELPER_PORT,
+  HANDSHAKE_TIMEOUT_MS,
   PROTOCOL_VERSION,
+  parseHandshakeServerMessage,
   parseHelperMessage,
+  sessionNonce,
+  sessionProof,
+  verifySessionProof,
+  type ClientAuthMessage,
+  type ClientChallengeMessage,
   type DiscordStatus,
-  type HelloMessage,
   type MemberInfo,
   type PluginToHelperMessage,
 } from "@dsd/shared";
 import WebSocket from "ws";
 
-const HELLO_TIMEOUT_MS = 3_000;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_CAP_MS = 5_000;
 const UNREACHABLE_AFTER_FAILURES = 3;
 
 export type HelperLink = "connecting" | "connected" | "down" | "port_conflict";
 
+/** Identity of the authenticated helper — only trustworthy post-handshake. */
+export interface HelperIdentity {
+  helperVersion: string;
+  buildId: string;
+  pid: number;
+}
+
 export interface SpeakerStoreState {
   helper: HelperLink;
-  hello: HelloMessage | null;
+  identity: HelperIdentity | null;
   status: DiscordStatus;
   statusDetail?: string;
   channelName: string | null;
@@ -43,7 +60,7 @@ export interface SpeakerStoreState {
 function initialState(): SpeakerStoreState {
   return {
     helper: "connecting",
-    hello: null,
+    identity: null,
     status: "disconnected",
     channelName: null,
     members: [],
@@ -66,18 +83,19 @@ export class SpeakerStore extends EventEmitter {
 
 export interface HelperClientOptions {
   store: SpeakerStore;
+  sessionKey: Buffer;
   port?: number;
   logger: { debug(m: string): void; info(m: string): void; warn(m: string): void };
 }
 
 /**
  * Events:
- * - "connected" (hello: HelloMessage)  — hello-gate passed; safe to send
- * - "helperUnreachable" ()             — 3 consecutive connect failures; manager should respawn
+ * - "connected" (identity: HelperIdentity)  — mutual auth passed; safe to send
+ * - "helperUnreachable" ()                  — 3 consecutive failures; manager should respawn
  */
 export class HelperClient extends EventEmitter {
   private ws: WebSocket | null = null;
-  private gated = false; // true after valid hello
+  private authed = false;
   private failures = 0;
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -102,10 +120,10 @@ export class HelperClient extends EventEmitter {
     this.ws = null;
   }
 
-  /** Hello-gated send. Returns false (and drops) when the gate is closed. */
+  /** Auth-gated send. Returns false (and drops) until mutual auth has completed. */
   send(msg: PluginToHelperMessage): boolean {
-    if (!this.gated || this.ws?.readyState !== WebSocket.OPEN) {
-      this.opts.logger.warn(`dropped ${msg.type}: helper link not established`);
+    if (!this.authed || this.ws?.readyState !== WebSocket.OPEN) {
+      this.opts.logger.warn(`dropped ${msg.type}: helper link not authenticated`);
       return false;
     }
     this.ws.send(JSON.stringify(msg));
@@ -114,50 +132,103 @@ export class HelperClient extends EventEmitter {
 
   private connect(): void {
     if (this.stopped) return;
-    this.gated = false;
+    this.authed = false;
+
+    // `ws` sends no Origin header unless asked — the helper rejects any upgrade that
+    // carries one, which is what keeps browsers out.
     const ws = new WebSocket(`ws://127.0.0.1:${this.port}`);
     this.ws = ws;
 
-    const helloTimer = setTimeout(() => {
-      // Connected but silent: a foreign process owns the port.
-      this.opts.logger.warn(`no hello within ${HELLO_TIMEOUT_MS} ms — foreign process on port ${this.port}?`);
+    /** Handshake progress: which frame we expect next. */
+    let phase: "hello" | "serverAuth" | "welcome" | "open" = "hello";
+    let serverNonce = "";
+    const clientNonce = sessionNonce();
+
+    const handshakeTimer = setTimeout(() => {
+      this.opts.logger.warn(
+        `handshake did not complete in ${HANDSHAKE_TIMEOUT_MS} ms — foreign process on port ${this.port}?`,
+      );
       this.opts.store.patch({ helper: "port_conflict" });
       ws.terminate();
-    }, HELLO_TIMEOUT_MS);
+    }, HANDSHAKE_TIMEOUT_MS);
+
+    /** Anything unexpected before the gate opens: say nothing, drop the socket. */
+    const refuse = (why: string, link: HelperLink = "port_conflict"): void => {
+      this.opts.logger.warn(why);
+      this.opts.store.patch({ helper: link });
+      ws.terminate();
+    };
 
     ws.on("open", () => this.opts.logger.debug("ws open; awaiting hello"));
 
     ws.on("message", (raw) => {
-      const msg = parseHelperMessage(raw.toString());
-      if (!msg) return;
+      const text = raw.toString();
 
-      if (msg.type === "hello") {
-        clearTimeout(helloTimer);
-        if (msg.protocolVersion !== PROTOCOL_VERSION) {
-          // Treated exactly like a buildId mismatch: the manager swaps the helper.
-          this.opts.logger.warn(
-            `helper protocol ${msg.protocolVersion} != ${PROTOCOL_VERSION}; requesting swap`,
+      if (phase === "hello") {
+        const hs = parseHandshakeServerMessage(text);
+        if (hs?.type !== "hello") return refuse("expected hello; terminating");
+        if (hs.protocolVersion !== PROTOCOL_VERSION) {
+          // A stale helper can neither be trusted nor authenticated. Refuse it: with no
+          // clients it idle-exits, then the manager spawns the current build.
+          return refuse(
+            `helper protocol ${hs.protocolVersion} != ${PROTOCOL_VERSION}; refusing (it will idle-exit)`,
+            "down",
           );
-          this.gated = true; // allow the shutdown message through
-          this.opts.store.patch({ hello: msg, helper: "connected" });
-          this.emit("connected", msg);
-          return;
         }
-        this.gated = true;
-        this.failures = 0;
-        this.opts.store.patch({ hello: msg, helper: "connected" });
-        this.emit("connected", msg);
+        serverNonce = hs.serverNonce;
+        const challenge: ClientChallengeMessage = { type: "clientChallenge", clientNonce };
+        ws.send(JSON.stringify(challenge));
+        phase = "serverAuth";
         return;
       }
 
-      if (!this.gated) return; // ignore everything else pre-hello
+      if (phase === "serverAuth") {
+        const hs = parseHandshakeServerMessage(text);
+        if (hs?.type !== "serverAuth") return refuse("expected serverAuth; terminating");
+        // THE moment that defeats a port-squatter: we send nothing — not our proof, and
+        // certainly not setCredentials — unless the peer proves it holds the session key.
+        const ok = verifySessionProof(this.opts.sessionKey, "S", serverNonce, clientNonce, hs.serverProof);
+        if (!ok) {
+          return refuse(`peer on port ${this.port} failed authentication — NOT the helper`);
+        }
+        const clientAuth: ClientAuthMessage = {
+          type: "clientAuth",
+          clientProof: sessionProof(this.opts.sessionKey, "C", serverNonce, clientNonce),
+        };
+        ws.send(JSON.stringify(clientAuth));
+        phase = "welcome";
+        return;
+      }
+
+      if (phase === "welcome") {
+        const msg = parseHelperMessage(text);
+        if (msg?.type !== "welcome") return refuse("expected welcome; terminating");
+        clearTimeout(handshakeTimer);
+        phase = "open";
+        this.authed = true;
+        this.failures = 0;
+        const identity: HelperIdentity = {
+          helperVersion: msg.helperVersion,
+          buildId: msg.buildId,
+          pid: msg.pid,
+        };
+        this.opts.logger.info(`helper authenticated (pid ${identity.pid}, build ${identity.buildId})`);
+        this.opts.store.patch({ identity, helper: "connected" });
+        this.emit("connected", identity);
+        return;
+      }
+
+      // ---- authenticated ----
+      const msg = parseHelperMessage(text);
+      if (!msg) return;
 
       switch (msg.type) {
+        case "welcome":
+          break; // a second welcome is meaningless; ignore
         case "status":
           this.opts.store.patch({
             status: msg.discord,
             statusDetail: msg.detail,
-            // Progress clears a stale authRequired flag.
             ...(msg.discord === "subscribed" || msg.discord === "authenticating"
               ? { authRequired: null, fatalError: null }
               : {}),
@@ -180,18 +251,18 @@ export class HelperClient extends EventEmitter {
     });
 
     const onGone = (): void => {
-      clearTimeout(helloTimer);
+      clearTimeout(handshakeTimer);
       if (this.ws !== ws) return; // superseded
       this.ws = null;
-      this.gated = false;
+      this.authed = false;
       if (this.stopped) return;
       this.failures++;
       if (this.opts.store.state.helper !== "port_conflict") {
-        this.opts.store.patch({ helper: this.failures >= UNREACHABLE_AFTER_FAILURES ? "down" : "connecting" });
+        this.opts.store.patch({
+          helper: this.failures >= UNREACHABLE_AFTER_FAILURES ? "down" : "connecting",
+        });
       }
-      if (this.failures === UNREACHABLE_AFTER_FAILURES) {
-        this.emit("helperUnreachable");
-      }
+      if (this.failures === UNREACHABLE_AFTER_FAILURES) this.emit("helperUnreachable");
       const delay = Math.min(RECONNECT_BASE_MS * 2 ** Math.min(this.failures, 4), RECONNECT_CAP_MS);
       this.reconnectTimer = setTimeout(() => this.connect(), delay);
     };

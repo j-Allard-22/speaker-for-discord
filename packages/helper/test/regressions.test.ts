@@ -96,7 +96,11 @@ describe("session consent discipline", () => {
           once: (_: string, __: () => void) => undefined,
           removeListener: () => undefined,
         }) as never,
-      authFn: (async (_c, _s, opts) => {
+      authFn: (async (
+        _c: unknown,
+        _s: unknown,
+        opts: { allowConsentPrompt: boolean },
+      ) => {
         consentFlags.push(opts.allowConsentPrompt);
         if (!opts.allowConsentPrompt) throw new AuthNeededError("token_invalid");
         return { user: { id: "u" }, auth: store.load()! };
@@ -146,7 +150,7 @@ describe("session consent discipline", () => {
           once: () => undefined,
           removeListener: () => undefined,
         }) as never,
-      authFn: (async (_c, _s, _opts, deps: AuthDeps) => {
+      authFn: (async (_c: unknown, _s: unknown, _opts: unknown, deps: AuthDeps) => {
         authCalls++;
         deps.onConsentPrompt?.(); // consent modal now "open"
         await new Promise(() => undefined); // hangs, like a real user staring at the modal
