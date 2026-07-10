@@ -43,7 +43,7 @@ Without `streamdeck dev`, `streamdeck restart` is silently ignored — the app l
 | Command | What it does |
 |---|---|
 | `npm run build` | shared (tsc) → helper (esbuild) → plugin (rollup) |
-| `npm run watch` | rebuild + auto `streamdeck restart` on plugin changes |
+| `npm run watch` | watch **both**: plugin (rebuild + auto `streamdeck restart`) and helper (rebuilds the bundle only) |
 | `npm test` | vitest, all packages |
 | `npm run typecheck` | tsc over src **and** tests |
 | `npm run validate` | `streamdeck validate` on the bundle |
@@ -78,15 +78,16 @@ last client disconnects (`orphan-watch.ts`), so it never becomes an orphan.
 
 ### The helper dev loop
 
-`npm run watch` only restarts the *plugin*. After changing helper code:
+`npm run watch` rebuilds the helper bundle on save too, but the **running** helper — a
+detached process — keeps executing the old code. To swap it in:
 
 ```powershell
-npm run build -w @dsd/helper
-npm run helper:restart          # helper exits; plugin spawns the new build
+npm run helper:restart          # helper exits; plugin spawns the fresh build
 ```
 
-(The plugin also swaps a stale helper automatically at startup by comparing
-`hello`/`welcome` `buildId` against `bin/helper.meta.json`.)
+(If the watcher isn't running, `npm run build -w @dsd/helper` first. The plugin also swaps
+a stale helper automatically at startup by comparing `hello`/`welcome` `buildId` against
+`bin/helper.meta.json`.)
 
 You can also run the helper completely standalone — no Stream Deck needed:
 
