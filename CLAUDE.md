@@ -14,7 +14,7 @@ Plugin UUID `com.vitamin.speaker-for-discord` — **immutable once published**.
 
 ```powershell
 npm run build            # shared (tsc) -> helper (esbuild) -> plugin (rollup)
-npm run watch            # rebuild + auto `streamdeck restart` (plugin only; helper persists)
+npm run watch            # both watchers: plugin (rollup + auto `streamdeck restart`) + helper (esbuild rebuild ONLY — running helper keeps old code)
 npm test                 # vitest; single file: npx vitest run <path>; by name: npx vitest run -t "name"
 npm run typecheck        # tsc over src AND tests (tsconfig.test.json)
 npm run validate         # streamdeck validate
@@ -27,6 +27,8 @@ streamdeck dev           # once; otherwise `streamdeck restart` is silently igno
 
 Node 24+ (`C:\Program Files\nodejs` — fresh shells may need it prepended to PATH).
 Tests need no Discord, no Stream Deck, and no network.
+Clean checkout: `build` must run **before** `typecheck` — helper/plugin resolve `@dsd/shared`
+types against `packages/shared/dist`, which doesn't exist yet.
 
 ## Architecture (two processes, three packages)
 
@@ -43,7 +45,8 @@ Stream Deck ──Elgato WS──► packages/plugin   (@elgato/streamdeck v2 �
 - `packages/shared` — wire protocol (`messages.ts`), constants, **`session-key.ts`** (the localhost
   auth crypto), `state-dir.ts`. Built with tsc first; both sides import it so they cannot drift.
 - `packages/helper` — owns the single Discord RPC connection. Discord rate-limits RPC connects to
-  ~2/min — that is WHY the helper outlives the plugin. esbuild → `<sdPlugin>/bin/helper.mjs` + `helper.meta.json`.
+  ~2/min — that is WHY the helper outlives the plugin. esbuild → `<sdPlugin>/bin/helper.mjs` + `helper.meta.json`
+  (buildId; the plugin compares it against `hello`/`welcome` and auto-swaps a stale helper at startup).
 - `packages/plugin` — hand-authored equivalent of the `streamdeck create` scaffold. Rollup → `bin/plugin.js`.
 
 ## Security invariants (do not regress — each has a regression test)
@@ -88,7 +91,10 @@ Stream Deck ──Elgato WS──► packages/plugin   (@elgato/streamdeck v2 �
 
 ## Publishing
 
-MIT, Windows-only, distributed as a `.streamDeckPlugin` on GitHub Releases (Elgato Marketplace later:
+MIT, Windows-only, distributed as a `.streamDeckPlugin` on GitHub Releases: push a `v*` tag and
+`.github/workflows/release.yml` builds, tests, packs, audits the archive for runtime/user data, and
+publishes the release. CI (`ci.yml`) runs build → typecheck → test → validate on `windows-latest`
+and fails if the manifest contains `Nodejs.Debug`. (Elgato Marketplace later:
 needs a Maker org, 3–10 gallery images at 1920×960, and a hosted privacy-policy URL).
 Discord brand rules forbid the "Discord X" name pattern and copying their colors — hence
 "Speaker for Discord" and the non-Blurple icon.
