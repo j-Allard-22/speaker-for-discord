@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+*.tsbuildinfo
+
+# build outputs inside the plugin bundle
+packages/plugin/com.joallard.discord-speaker.sdPlugin/bin/
+packages/plugin/com.joallard.discord-speaker.sdPlugin/logs/
+
+# packaged plugin
+*.streamDeckPlugin
+
+# local secrets must never land here, but belt-and-braces
+.env
+.env.*
+
+.claude/

@@ -1,0 +1,110 @@
+# Building "Currently-Speaking" Stream Deck Plugins for Discord and Xbox Party Chat: A Technical Report
+
+## TL;DR
+- **Discord is fully feasible today.** A Stream Deck plugin (Node.js/TypeScript, `@elgato/streamdeck`) plus a small local helper that connects to Discord's local RPC/IPC socket can subscribe to `SPEAKING_START`/`SPEAKING_STOP` (scopes `rpc` + `rpc.voice.read`), get the speaking `user_id`, fetch the avatar from Discord's CDN, and render icon+truncated name to a key via `setImage` with an SVG data URI.
+- **Xbox party voice "who is speaking" is effectively a dead end on PC.** There is no official API surfacing party-chat active-speaker state, the Game Bar Widget SDK is deprecated/isolated, GameChat2/PlayFab Party APIs are title-side only, and party audio reaches the PC as a single mixed stream — so audio metering can at best tell you "someone in the party is talking," never who.
+- **Recommended architecture:** one Node.js/TS Stream Deck plugin front-end + one persistent local helper service that owns the Discord RPC connection and (optionally) a best-effort "party active / someone speaking" WASAPI meter for Xbox, pushing speaker updates to the plugin over a localhost WebSocket.
+
+## Key Findings
+
+### A) Stream Deck SDK
+- The modern, recommended path is the **Node.js/TypeScript SDK `@elgato/streamdeck`** driven by the `@elgato/cli` ("Maker") tooling. Per Elgato's official docs, "Creating Stream Deck plugins with Node.js requires **Node.js 24 or higher, and Stream Deck 7.1 or higher**." It uses class-based `SingletonAction` actions and is the most durable, best-documented option.
+- Keys are updated at runtime with **`setImage`** (SVG string, or base64 data URI for PNG/JPEG/WEBP) and **`setTitle`**. Per the Keys guide, "The `setImage` function **does not support animated image formats, such as GIF**." SVG is recommended and lets you composite a large avatar plus a small truncated name in one image.
+- The plugin communicates with the Stream Deck app over a **dedicated local WebSocket** (registration handshake via `connectElgatoStreamDeckSocket` / `registerPlugin`); a plugin backend talks to a separate helper by opening its own second socket.
+- Key render resolution is small. Elgato's Marketplace Plugin Guidelines specify a **key icon of "72 × 72 px — and 144 × 144 px (high DPI) when using rasterized images"**; author square art at 144×144 (or 288×288) and let the firmware downscale.
+
+### B) Discord "currently speaking" — FEASIBLE
+- Discord's local client runs an **RPC server on IPC** (Windows named pipe `\\?\pipe\discord-ipc-0..9`; Unix socket under `$XDG_RUNTIME_DIR`). Connect, `AUTHORIZE` with scopes `["rpc","rpc.voice.read"]`, exchange the code for a token, `AUTHENTICATE`.
+- Get the active channel with `GET_SELECTED_VOICE_CHANNEL`, then **`SUBSCRIBE` to `SPEAKING_START` and `SPEAKING_STOP` with `args:{channel_id}`**. Dispatched events carry `data.user_id` of the speaker. Also subscribe to `VOICE_CHANNEL_SELECT` to re-subscribe on channel change.
+- **Scope nuance:** older official docs say `SPEAKING_START` "requires the `rpc.notifications.read` OAuth2 scope," which is outdated. The correct current scope, per Discord's OAuth2 scope tables (mirrored in discord-api-types v10 and Flask-Discord), is **`rpc.voice.read`**: "For local rpc server access, this allows you to read a user's voice settings **and listen for voice events** - requires Discord approval."
+- **Avatar:** build `https://cdn.discordapp.com/avatars/USER_ID/AVATAR_HASH.png?size=128` (hashes starting `a_` are animated → `.gif`); the hash comes from the voice-channel member data.
+- **Approval gate / personal use:** `rpc.voice.read` is approval-gated, but per Discord Userdoccers (docs.discord.food/topics/oauth2, note 5): "Unless the application is approved for general RPC access, the `rpc` scope is allowed for the **application owner and whitelisted users only**." Discord's RPC docs add: "We grant **50 testing spots**... After approval, this restriction is removed," and the application-resource docs confirm "Applications may have a **maximum of 50 whitelisted users**." This fully covers personal use: create your own app, keep Public Bot OFF, add your accounts as testers.
+- **Reference implementations:** `Eric-D/obs-discord-voice-overlay` (Rust, raw IPC, explicitly uses `rpc`+`rpc.voice.read`, tracks a speaking set) and `RaidMax/discord-speaker-overlay` (Node.js, `discord-rpc` lib) both do active-speaker tracking. Existing Stream Deck Discord plugins (Elgato's official plugin, `fredemmott/StreamDeck-Discord`, `CZDanol/StreamDeck-DiscordVolumeMixer2`) do mute/deafen/volume/speaking-indicator, but none render the predominant speaker's avatar+name to a key.
+
+### C) Xbox party / Game Bar "currently speaking" — NOT FEASIBLE (per-speaker)
+- **Game Bar Widget SDK:** a UWP XAML widget platform for rendering *into* Game Bar; the `XboxGameBarWidget` object handles window/state IPC (pinning, sizing, `XboxGameBarWidgetActivity` to prevent idle shutdown during voice chat) but exposes **no party-chat/active-speaker data** to third parties, and the SDK has been essentially frozen since the 2020 widget-store launch.
+- **GameChat2 / PlayFab Party:** *title-integrated* GDK SDKs. GameChat2 does track per-user chat-indicator "talking/muted" state and can separate per-remote-user audio via `post_decode_audio_source_stream` — **but only inside the game/app that hosts that chat session.** The system Xbox party (Win+G Xbox Social) is not your app's session, so you cannot attach to it.
+- **Audio approach:** On PC, Xbox party audio arrives as a **single mixed stream** (users on OBS/Xbox forums repeatedly confirm it can't be separated per-speaker and OBS can't cleanly see/route it). WASAPI per-process metering (`IAudioSessionManager2` + `IAudioMeterInformation::GetPeakValue`) can detect the party process emitting audio — "someone is talking" — but Windows has "no API for enumerating individual streams within a session," so **it cannot attribute audio to a specific gamertag.**
+- **UI scraping:** The PC party overlay has no stable, documented accessibility element exposing per-speaker highlight state; UIAutomation/OCR would be brittle and undocumented.
+- **Verdict:** Per-speaker Xbox party detection on PC is a dead end without official APIs. Only "party active / someone speaking" is partially feasible via audio metering.
+
+## Details
+
+### A) Stream Deck SDK landscape
+The **official modern SDK is `@elgato/streamdeck`** (TypeScript/Node), scaffolded with `npm install -g @elgato/cli` then `streamdeck create`. Actions extend `SingletonAction` and override lifecycle methods such as `onWillAppear`, `onKeyDown`, `onKeyUp`. The scaffold produces a `*.sdPlugin` folder (`manifest.json`, `bin/`, `imgs/`, `ui/`) plus a `src/` TypeScript project; `npm run watch` hot-reloads into Stream Deck. Node version and debugging are configured in the manifest's `Nodejs` block (`"Version": "24"`, `"Debug": "enabled"` gives `--inspect`).
+
+Compared with the **legacy approaches** — the older HTML/JS property-inspector-plus-JS plugins, native C++/C# plugins registering over the WebSocket directly (e.g., BarRaider's `streamdeck-tools` for C#), and community SDKs (`@rweich/streamdeck-ts`, `@stream-deck-for-node/sdk`, the HID-level `elgato-stream-deck`) — the official Node/TS SDK is the most flexible and durable for a long-lived project: actively maintained, type-safe, and the basis for Elgato's own first-party plugins (including the Discord plugin). For a developer comfortable in JS/TS this is the clear recommendation. Native C++/C# remains an option if you must embed platform APIs (e.g., WASAPI) directly in-process, but Elgato explicitly calls native plugins "an advanced technique... not recommended," suggesting Node.js native addons instead.
+
+**Rendering to a key.** `setImage(image?, options?)` accepts a file path, an SVG string, or a base64 data URI (`image/png`, `image/jpeg`, `image/webp`, `image/svg+xml`). GIF/animation is unsupported when updating programmatically. `setTitle` renders text at top/middle/bottom over the image. The recommended pattern for a big avatar plus a small name is to **render everything as one SVG and call `setTitle("")`** — this is stated directly by developer Nick Liu ("Two Stream Deck SDK quirks that cost me a weekend"): "For any non-trivial key layout, render the whole key as an SVG via `setImage()` and call `setTitle('')`." Elgato's own Keys-guide example shows the efficient encoding: `ev.action.setImage(\`data:image/svg+xml,${encodeURIComponent(svg)}\`)` — smaller and faster than base64 for SVG. Display precedence: a user-set custom image/title overrides your `setImage`/`setTitle`, which overrides the manifest default.
+
+**Refresh rate.** There is no documented hard per-key FPS cap. The transport is a JSON WebSocket to the app, which then pushes over USB HID to a low-res display; updating a key a **few times per second is fine**, well within what speaking-state transitions require. For a "predominant speaker," debounce — update only when the active speaker actually changes, not on every audio frame — and avoid high-frequency updates across many keys at once.
+
+**Resolution/format constraints.** Standard Stream Deck and MK.2 keys are small square LCDs; per Elgato's guidelines the key icon target is **72 × 72 px (144 × 144 px for high-DPI rasterized images)**, and Nick Liu notes the SDK "passes the SVG bytes through to the device firmware as a 72×72 image." Stream Deck + adds 4 dials and an LCD touch strip (dial displays can show an avatar + percentage, as Elgato's Discord plugin does for per-user volume). Author your SVG/PNG square at 144×144 or 288×288 for crispness across devices.
+
+**Communication with external processes.** Each plugin gets a dedicated WebSocket to the Stream Deck app: the app launches your plugin with `-port`, `-pluginUUID`, `-registerEvent registerPlugin`; you connect to `ws://127.0.0.1:<port>` and send `{event, uuid}`. To talk to a separate helper/local server, your plugin (its own Node process) simply opens **its own** outbound connection (e.g., a WebSocket client to `ws://127.0.0.1:<your-port>`), independent of the Elgato socket. This two-socket model is exactly what you want: Elgato socket for key I/O, your own socket to the Discord/Xbox helper.
+
+### B) Discord integration in depth
+
+**Transport & handshake.** All Discord desktop clients run a local RPC server. Prefer the **IPC transport**: Windows named pipe `\\?\pipe\discord-ipc-0` (try `-0` through `-9`); macOS/Linux socket `discord-ipc-N` under `$XDG_RUNTIME_DIR`/`TMPDIR`/`/tmp` (Flatpak/Snap add prefix subdirs). Frame format: 8-byte little-endian header (opcode + JSON length) followed by JSON. HANDSHAKE (opcode 0): `{"v":1,"client_id":"<APP_ID>"}`; the server responds with a `READY` dispatch. (A WebSocket transport on ports 6463–6472 exists but is restricted to trusted partners for browser origins; the HTTP GET transport only grants `rpc.private.limited` and can't complete the authenticated handshake — use IPC.)
+
+**Auth & subscription sequence:**
+1. `AUTHORIZE` → `{"cmd":"AUTHORIZE","args":{"client_id":"<APP_ID>","scopes":["rpc","rpc.voice.read"]}}` → returns `code`.
+2. `POST https://discord.com/api/oauth2/token` (standard OAuth2 body with client_id/client_secret/code) → `access_token`.
+3. `AUTHENTICATE` → `{"cmd":"AUTHENTICATE","args":{"access_token":"..."}}`.
+4. `GET_SELECTED_VOICE_CHANNEL` → response `data.id` = voice channel id; `data.voice_states[]` = members (each with user id, username/global_name, avatar hash, mute/deaf flags).
+5. `SUBSCRIBE` twice: `{"cmd":"SUBSCRIBE","evt":"SPEAKING_START","args":{"channel_id":"<id>"}}` and same for `SPEAKING_STOP`.
+6. Incoming: `{"cmd":"DISPATCH","evt":"SPEAKING_START","data":{"user_id":"..."}}`.
+7. Also `SUBSCRIBE` to `VOICE_CHANNEL_SELECT` to detect channel switches and re-subscribe with the new `channel_id`.
+
+The speaking payload contains **only `user_id`** — correlate it against the member list from `GET_SELECTED_VOICE_CHANNEL` to resolve username + avatar hash.
+
+**Scope confusion, resolved.** The legacy docs page states `SPEAKING_START`/`SPEAKING_STOP` require `rpc.notifications.read`; this is outdated. The correct scope — documented later (discord-api-docs PR #2894) and reflected in the discord-api-types/discord.js/Flask-Discord scope enums — is **`rpc.voice.read`** ("read a user's voice settings and listen for voice events"). Historically, discord/discord-rpc Issue #242 has a maintainer saying these events weren't fetchable outside the deprecated GameBridge whitelist — but that reply concerns the old C++ Rich-Presence-only SDK and does not reflect current behavior; modern repos receive the events via `rpc.voice.read`.
+
+**Avatar CDN.** `https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png` with optional `?size=` (powers of two, 16–4096; use 128). Animated avatars have hashes starting `a_` and use `.gif` (rasterize to a still frame for the key since GIF isn't supported by `setImage`). Users on the default avatar need the default-avatar endpoint. Avatar URLs are public (no auth to fetch).
+
+**Approval / rate limits / reliability.** RPC/`rpc.voice.read` are approval-gated for general distribution, but the **app owner is implicitly allowed** and up to **50 whitelisted testers** may use it — so for personal use, create an app, keep Public Bot OFF, and add tester accounts; no formal approval needed. The RPC server has a connection rate limit (~2 connections/min on stable clients); handle reconnects with backoff. The IPC server echoes every command as a response (use as a lock-step to avoid flooding). Handle the documented client bug where some incoming objects arrive camelCase instead of snake_case.
+
+**Existing work to reuse.** Best reference: **`Eric-D/obs-discord-voice-overlay`** (Rust; raw IPC; `oauth.rs` AUTHORIZE→token→AUTHENTICATE; `events.rs` typed VoiceState/Speaking/ChannelSelect + SUBSCRIBE helpers; `state.rs` maintains participants map + speaking set; follows the active channel). Also **`RaidMax/discord-speaker-overlay`** (Node, `discord-rpc`), **`dichternebel/voice-channel-grabber`** (C#, DiscordIPC, tracks selected voice channel), and libraries **`discordjs/RPC`**, **`pypresence`**, **`jagrosh/DiscordIPC`**. These are OBS overlays / voice tools — none render the predominant speaker to a Stream Deck key, which is the novel part of this project.
+
+### C) Xbox party chat — exhaustive assessment
+
+**Official API/SDK surface.** The **Xbox Game Bar Widget SDK** (`Microsoft.Gaming.XboxGameBar` NuGet; `microsoft/XboxGameBarSamples`) lets you build UWP XAML widgets hosted in Game Bar. The `XboxGameBarWidget` object provides IPC between your widget and Game Bar for window/state management (pinning, sizing, settings button, `XboxGameBarWidgetActivity` to prevent idle shutdown "to support long-running user activities, such as voice chat"). Crucially, this API concerns **your widget's own presentation**, not reading the Xbox Social party's roster or active-speaker state. There is no documented method to query "who is speaking in the party," and the SDK/platform has seen essentially no feature evolution since the 2020 widget-store launch.
+
+**Xbox Live / Graph / GameChat.** No public Xbox Live or Microsoft Graph endpoint streams live party membership + speaking state to an arbitrary local app. **GameChat2** and **PlayFab Party** are GDK SDKs a *title* integrates for its own chat. GameChat2 tracks per-user chat-indicator state ("talking/muted") and supports post-decode audio manipulation with per-source streams (`post_decode_audio_source_stream`), and it *can* separate per-remote-user audio — **but only inside the game/app that hosts that chat session.** The system party run by the Xbox app / Game Bar is not your app's chat session, so you cannot attach to it. The accessibility "party chat transcription" (speech-to-text) is a user-facing setting, not a developer data feed.
+
+**Audio-based detection (partial at best).** On PC, community reports (OBS forums, Xbox support, Sea of Thieves forums) consistently show Xbox party audio is delivered as a **single mixed output** that isn't cleanly separable or even reliably visible to capture tools; the only workaround people find is routing through a virtual audio device (VoiceMeeter). WASAPI (`IMMDeviceEnumerator` → `IAudioSessionManager2::GetSessionEnumerator` → per-session `IAudioMeterInformation::GetPeakValue`, values normalized 0.0–1.0) can identify the audio session belonging to the Xbox party process and read its peak level, giving a reliable **"someone in the party is currently talking"** signal. But there is **no per-speaker separation** in that mixed stream — Windows explicitly has "no API for enumerating individual streams within a session," and the mix contains all remote talkers combined. Attribution to a specific gamertag is impossible this way.
+
+**UI scraping / reverse engineering.** UIAutomation of the Game Bar party widget is undocumented and fragile; the PC party overlay does not expose a stable, persistent per-member speaking-highlight element to the accessibility tree the way the Xbox *console* party overlay shows a speaking ring. Screen-region OCR/image detection would be brittle (overlay must be visible, layout changes break it) and is not durable. No credible public project demonstrates per-speaker Xbox party detection on PC via memory reading or network sniffing; party audio/signaling is encrypted and undocumented.
+
+**Realistic feasibility ranking for Xbox:**
+- *Feasible:* "Party chat process is producing audio right now" (WASAPI meter) → a generic "someone's talking" key.
+- *Partially feasible / fragile:* detecting the party is connected and the local user's mute state via Game Bar UI or audio-session presence.
+- *Dead end:* identifying **which** gamertag is speaking, and fetching that gamertag's avatar, purely from the PC Xbox app/Game Bar.
+
+## Recommendations
+
+**Stage 1 — Build the Discord feature first (high value, fully feasible).**
+1. Scaffold a Node/TS plugin with `@elgato/cli` (`streamdeck create`), targeting Stream Deck 7.1+/Node 24.
+2. Write a **local helper service** (Node process, bundleable with the plugin) that owns the Discord IPC connection using `discordjs/RPC` or a thin raw-IPC implementation modeled on `Eric-D/obs-discord-voice-overlay`. Request scopes `["rpc","rpc.voice.read"]`. Register your own Discord app, Public Bot OFF, add yourself as a tester.
+3. In the helper: `GET_SELECTED_VOICE_CHANNEL` → cache member map (id → name, avatar hash); `SUBSCRIBE` to `SPEAKING_START`/`SPEAKING_STOP` with `channel_id`; on `VOICE_CHANNEL_SELECT`, re-fetch and re-subscribe. Maintain a "current predominant speaker" (last `SPEAKING_START` without a matching `SPEAKING_STOP`; if several, pick most recent or first).
+4. Push `{userId, displayName, avatarUrl}` to the plugin over a localhost WebSocket. The plugin fetches/caches the avatar PNG (`cdn.discordapp.com/avatars/...?size=128`), builds one **SVG** with the avatar filling the key and the name in a small bottom band **truncated** (e.g., ~8–10 chars + ellipsis), then calls `setImage(svgDataUri)` + `setTitle("")`. Debounce so you only redraw on speaker change; show a neutral idle image when nobody is speaking.
+
+**Stage 2 — Xbox: ship only what's honest.** Implement a **WASAPI peak-meter helper** (C#/NAudio `MMDevice.AudioMeterInformation`, or a native addon; target the Xbox party audio session by process) that drives a single "Party — someone's talking" key (generic party icon that lights/pulses). Do **not** promise per-speaker avatars for Xbox — it isn't achievable with current PC APIs.
+
+**Benchmarks / thresholds that would change these recommendations:**
+- If Microsoft ships a Game Bar or Xbox app API exposing party roster + speaking events (watch the Game Bar SDK changelog and GDK GameChat docs), revisit per-speaker Xbox.
+- If you can force the Xbox party to a dedicated output device *and* correlate with an independent per-gamertag signal, revisit — but today no such signal exists on PC.
+- If Discord grants your app general RPC approval, you can distribute publicly beyond the 50-tester limit.
+
+**Biggest technical risks/unknowns:**
+- Discord's `rpc.voice.read` remains approval-gated; personal use is fine, public distribution needs approval.
+- Relying on the *outdated* docs' scope name (`rpc.notifications.read`) would break the app — use `rpc.voice.read`.
+- Stream Deck app-state quirks: `willAppear` may not re-fire after a plugin restart (Nick Liu: "If `willAppear` doesn't fire after a plugin restart, toggle the profile. It's an app-side state-machine quirk, not your code."). Re-emit state on your helper's `ready`.
+- Xbox: everything beyond "someone is talking" is unsupported and should be treated as out of scope.
+
+## Caveats
+- Discord's RPC/IPC surface is only partially documented and has known client bugs (camelCase vs snake_case payloads); the authoritative community reference is Discord Userdoccers (discord.food), which contradicts the legacy official docs on the speaking-event scope. Treat `rpc.voice.read` as correct.
+- The "50 tester" allowance and owner-implicit-access are Discord policy that can change; verify in the developer portal before relying on it.
+- Stream Deck has no officially published maximum key-image refresh rate; the "few updates per second is fine" guidance is from device behavior and third-party developer experience, not a documented spec — debounce to be safe.
+- The Xbox conclusions rest on Microsoft's own SDK docs (Widget SDK scope; GameChat2 being title-side) plus consistent community reports that PC party audio is a single mixed stream; if any of these change, the per-speaker verdict could change.
+- No existing Stream Deck plugin renders the predominant speaker's avatar+name to a key for either platform; you are building novel integration on top of proven building blocks.

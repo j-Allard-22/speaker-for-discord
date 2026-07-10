@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Current Speaker settings</title>
+  <script src="sdpi-components.js"></script>
+  <style>
+    #status-line {
+      font-size: 11px;
+      color: #969696;
+      white-space: pre-line;
+    }
+    details.guide {
+      margin: 8px 6px;
+      font-size: 11px;
+      color: #b0b0b0;
+    }
+    details.guide code {
+      user-select: all;
+      background: #2a2a2a;
+      padding: 0 3px;
+      border-radius: 3px;
+    }
+    details.guide ol {
+      padding-left: 16px;
+      margin: 4px 0;
+    }
+    details.guide li {
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <sdpi-item label="Client ID">
+    <sdpi-textfield setting="clientId" global placeholder="Discord Application ID"></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="Client Secret">
+    <sdpi-password setting="clientSecret" global placeholder="OAuth2 Client Secret"></sdpi-password>
+  </sdpi-item>
+
+  <sdpi-item label="">
+    <sdpi-button id="reauthorize">Re-authorize</sdpi-button>
+  </sdpi-item>
+  <sdpi-item label="">
+    <div id="reauth-hint" style="font-size:10px;color:#7a7a7a">
+      Only needed when the key shows “Authorize”. Saving credentials above already
+      triggers Discord's consent dialog — check the Discord app for it.
+    </div>
+  </sdpi-item>
+
+  <sdpi-item label="Status">
+    <div id="status-line">connecting…</div>
+  </sdpi-item>
+
+  <sdpi-item label="Helper port">
+    <sdpi-textfield setting="helperPort" global placeholder="39642 (change only on port conflict)"></sdpi-textfield>
+  </sdpi-item>
+
+  <details class="guide">
+    <summary>How to create your Discord app (one time, ~3 min)</summary>
+    <ol>
+      <li>Open <code>discord.com/developers/applications</code> &rarr; <b>New Application</b>.</li>
+      <li>Copy the <b>Application ID</b> into <i>Client ID</i> above.</li>
+      <li><b>OAuth2</b> page &rarr; <b>Reset Secret</b> &rarr; paste into <i>Client Secret</i> (shown once!).</li>
+      <li>Under <b>OAuth2 &rarr; Redirects</b> add exactly <code>http://127.0.0.1</code> and save.</li>
+      <li>If an <b>RPC Origins</b> field exists, add <code>http://127.0.0.1</code> there too.</li>
+      <li>No bot needed. If one exists: <b>Public Bot OFF</b>.</li>
+      <li>When Discord pops its authorization dialog, click <b>Authorize</b> (once).</li>
+    </ol>
+    <p>Note: keep the Discord <i>desktop</i> app running, and don't set a custom image on
+    this key in Stream Deck — it would permanently cover the live avatar.</p>
+  </details>
+
+  <script>
+    const { streamDeckClient } = SDPIComponents;
+    const statusLine = document.getElementById("status-line");
+
+    document.getElementById("reauthorize").addEventListener("click", () => {
+      streamDeckClient.send("sendToPlugin", { event: "reauthorize" });
+    });
+
+    // SECURITY: channel names are Discord-controlled -> textContent ONLY, never innerHTML.
+    function renderStatus(p) {
+      if (!p || p.event !== "status") return;
+      const lines = [];
+      lines.push(`Helper: ${p.helper}`);
+      let discord = `Discord: ${p.discord}`;
+      if (p.discord === "subscribed" && p.channelName) discord += ` (#${p.channelName})`;
+      if (p.detail) discord += ` — ${p.detail}`;
+      lines.push(discord);
+      if (p.authRequired === "no_credentials") lines.push("Enter your Client ID + Secret above.");
+      if (p.authRequired === "consent_required") lines.push("Authorization needed: press Re-authorize, then approve in Discord.");
+      if (p.authRequired === "token_invalid") lines.push("Session expired: press Re-authorize.");
+      if (p.fatalError) lines.push(`Error: ${p.fatalError}`);
+      statusLine.textContent = lines.join("\n");
+    }
+
+    streamDeckClient.sendToPropertyInspector.subscribe((ev) => {
+      renderStatus(ev && ev.payload ? ev.payload : ev);
+    });
+
+    // Ask for a status snapshot as soon as the PI opens.
+    streamDeckClient.send("sendToPlugin", { event: "getStatus" });
+  </script>
+</body>
+</html>

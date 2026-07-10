@@ -1,0 +1,206 @@
+import { EventEmitter } from "node:events";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import type { MemberInfo } from "@dsd/shared";
+import { DiscordSession } from "../src/discord/session";
+import type { DiscordRpcClient } from "../src/discord/rpc-client";
+import { TokenStore } from "../src/discord/token-store";
+import { HelperLogger } from "../src/logger";
+import { SpeakerTracker, type RawVoiceState } from "../src/speaker-tracker";
+
+function vs(id: string, name: string): RawVoiceState {
+  return { user: { id, username: name, discriminator: "0" } };
+}
+
+/** Scripted RPC client: commands resolve via a handler map the test controls. */
+class ScriptedClient extends EventEmitter {
+  isClosed = false;
+  commands: Array<{ cmd: string; args?: Record<string, unknown>; evt?: string }> = [];
+
+  constructor(
+    private readonly handler: (
+      cmd: string,
+      args?: Record<string, unknown>,
+      evt?: string,
+    ) => unknown | Promise<unknown>,
+  ) {
+    super();
+  }
+
+  async connect(): Promise<Record<string, unknown>> {
+    return {};
+  }
+
+  async sendCommand(cmd: string, args?: Record<string, unknown>, evt?: string): Promise<unknown> {
+    this.commands.push({ cmd, args, evt });
+    return await this.handler(cmd, args, evt);
+  }
+
+  subscribe(evt: string, args?: Record<string, unknown>): Promise<unknown> {
+    return this.sendCommand("SUBSCRIBE", args, evt);
+  }
+  unsubscribe(evt: string, args?: Record<string, unknown>): Promise<unknown> {
+    return this.sendCommand("UNSUBSCRIBE", args, evt);
+  }
+
+  close(): void {
+    if (this.isClosed) return;
+    this.isClosed = true;
+    this.emit("close", null);
+  }
+
+  dispatch(evt: string, data: unknown): void {
+    this.emit("dispatch", evt, data);
+  }
+}
+
+function makeSession(client: ScriptedClient) {
+  const store = new TokenStore(mkdtempSync(join(tmpdir(), "dsd-session-")));
+  store.save({ clientId: "app", clientSecret: "s", accessToken: "at", expiresAt: Date.now() + 1e9 });
+  const tracker = new SpeakerTracker({ switchDebounceMs: 0, idleHoldMs: 0 });
+  const logger = new HelperLogger({
+    dir: mkdtempSync(join(tmpdir(), "dsd-session-log-")),
+    mirrorToConsole: false,
+  });
+  const session = new DiscordSession({
+    store,
+    tracker,
+    logger,
+    clientFactory: () => client as unknown as DiscordRpcClient,
+    authFn: async () => ({ user: { id: "me" }, auth: store.load()! }),
+    sleepFn: async () => undefined,
+  });
+  return { session, tracker, store };
+}
+
+describe("DiscordSession bootstrap", () => {
+  it("subscribes in the race-safe order and installs the GET_CHANNEL roster last", async () => {
+    const client = new ScriptedClient((cmd, _args, evt) => {
+      if (cmd === "SUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL")
+        return { id: "c1", name: "General", guild_id: "g1", voice_states: [vs("A", "Alice")] };
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const { session, tracker } = makeSession(client);
+    const statuses: string[] = [];
+    session.on("status", (s: string) => statuses.push(s));
+
+    session.startFromStored();
+    await vi.waitFor(() => expect(session.status.discord).toBe("subscribed"));
+
+    // Order: VOICE_CHANNEL_SELECT first, then GET_SELECTED_VOICE_CHANNEL (id only),
+    // then the 5 channel events, then GET_CHANNEL as the authoritative roster.
+    const cmdSeq = client.commands.map((c) => c.evt ?? c.cmd);
+    expect(cmdSeq).toEqual([
+      "VOICE_CHANNEL_SELECT",
+      "GET_SELECTED_VOICE_CHANNEL",
+      "VOICE_STATE_CREATE",
+      "VOICE_STATE_UPDATE",
+      "VOICE_STATE_DELETE",
+      "SPEAKING_START",
+      "SPEAKING_STOP",
+      "GET_CHANNEL",
+    ]);
+    expect(tracker.memberList.map((m) => m.userId)).toEqual(["A"]);
+    expect(session.channel).toEqual({ channelId: "c1", guildId: "g1", channelName: "General" });
+    session.stop();
+  });
+
+  it("buffers events arriving during bootstrap and replays them onto the roster", async () => {
+    let releaseGetChannel!: () => void;
+    const gate = new Promise<void>((r) => (releaseGetChannel = r));
+    const client = new ScriptedClient(async (cmd, _args, evt) => {
+      if (cmd === "SUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL") {
+        await gate; // hold the roster back while events stream in
+        return { id: "c1", name: "General", guild_id: null, voice_states: [vs("A", "Alice")] };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const { session, tracker } = makeSession(client);
+    session.startFromStored();
+
+    await vi.waitFor(() =>
+      expect(client.commands.some((c) => c.cmd === "GET_CHANNEL")).toBe(true),
+    );
+    // Bootstrap window: a member joins AND starts speaking before the roster lands.
+    client.dispatch("VOICE_STATE_CREATE", vs("D", "Dave"));
+    client.dispatch("SPEAKING_START", { user_id: "D" });
+
+    releaseGetChannel();
+    await vi.waitFor(() => expect(session.status.discord).toBe("subscribed"));
+    await vi.waitFor(() => {
+      // Dave must exist AND be speaking — the ghost guard must NOT have eaten him.
+      expect(tracker.memberList.map((m) => m.userId).sort()).toEqual(["A", "D"]);
+      expect(tracker.speakingCount).toBe(1);
+      expect(tracker.currentSpeaker?.userId).toBe("D");
+    });
+    session.stop();
+  });
+
+  it("abandons a stale bootstrap when the channel switches mid-flight (generation counter)", async () => {
+    const releases = new Map<string, () => void>();
+    const gateFor = (id: string) => new Promise<void>((r) => releases.set(id, r));
+    const client = new ScriptedClient(async (cmd, args, evt) => {
+      if (cmd === "SUBSCRIBE" || cmd === "UNSUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL") {
+        const id = String(args?.["channel_id"]);
+        await gateFor(id);
+        return id === "c1"
+          ? { id, name: "OLD", guild_id: null, voice_states: [vs("OLD", "OldGuy")] }
+          : { id, name: "NEW", guild_id: null, voice_states: [vs("NEW", "NewGuy")] };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const { session, tracker } = makeSession(client);
+    session.startFromStored();
+
+    // Wait until c1's GET_CHANNEL is in flight, then switch to c2 BEFORE it resolves.
+    await vi.waitFor(() => expect(releases.has("c1")).toBe(true));
+    client.dispatch("VOICE_CHANNEL_SELECT", { channel_id: "c2", guild_id: null });
+    await vi.waitFor(() => expect(releases.has("c2")).toBe(true));
+
+    // Resolve the STALE c1 response first — it must be discarded.
+    releases.get("c1")!();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(tracker.memberList.map((m) => m.userId)).not.toContain("OLD");
+
+    releases.get("c2")!();
+    await vi.waitFor(() => {
+      expect(session.channel.channelName).toBe("NEW");
+      expect(tracker.memberList.map((m) => m.userId)).toEqual(["NEW"]);
+    });
+    session.stop();
+  });
+
+  it("leaving voice (VOICE_CHANNEL_SELECT null) clears state and reports no_channel", async () => {
+    const client = new ScriptedClient((cmd, _args, evt) => {
+      if (cmd === "SUBSCRIBE" || cmd === "UNSUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL")
+        return { id: "c1", name: "General", guild_id: null, voice_states: [vs("A", "Alice")] };
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const { session, tracker } = makeSession(client);
+    const speakers: Array<MemberInfo | null> = [];
+    tracker.on("speaker", (s: MemberInfo | null) => speakers.push(s));
+
+    session.startFromStored();
+    await vi.waitFor(() => expect(session.status.discord).toBe("subscribed"));
+    client.dispatch("SPEAKING_START", { user_id: "A" });
+    await vi.waitFor(() => expect(tracker.currentSpeaker?.userId).toBe("A"));
+
+    client.dispatch("VOICE_CHANNEL_SELECT", { channel_id: null });
+    await vi.waitFor(() => expect(session.status.discord).toBe("no_channel"));
+    expect(tracker.currentSpeaker).toBeNull(); // stale speaker cleared IMMEDIATELY
+    expect(speakers.at(-1)).toBeNull();
+    // Old channel's events were unsubscribed (errors would be swallowed).
+    expect(client.commands.filter((c) => c.cmd === "UNSUBSCRIBE")).toHaveLength(5);
+    session.stop();
+  });
+});

@@ -1,0 +1,27 @@
+{
+  "name": "streamdeck-discord-speaker",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @dsd/shared && npm run build -w @dsd/helper && npm run build -w @dsd/plugin",
+    "watch": "concurrently -k \"npm:watch:helper\" \"npm:watch:plugin\"",
+    "watch:helper": "npm run watch -w @dsd/helper",
+    "watch:plugin": "npm run watch -w @dsd/plugin",
+    "test": "vitest run",
+    "helper:probe": "node packages/helper/scripts/ws-probe.mjs",
+    "helper:restart": "node packages/helper/scripts/ws-probe.mjs --shutdown",
+    "validate": "streamdeck validate packages/plugin/com.joallard.discord-speaker.sdPlugin"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "esbuild@0.25.12": true
+  }
+}
