@@ -78,6 +78,7 @@ function channelMessage(): HelperToPluginMessage {
     type: "channel",
     channelId: c.channelId,
     guildId: c.guildId,
+    guildIconUrl: c.guildIconUrl,
     channelName: c.channelName,
     members: tracker.memberList,
   };

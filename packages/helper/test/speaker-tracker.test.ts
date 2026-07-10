@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MemberInfo } from "@dsd/shared";
-import { buildAvatarUrl, SpeakerTracker, type RawVoiceState } from "../src/speaker-tracker";
+import {
+  buildAvatarUrl,
+  buildGuildIconUrl,
+  SpeakerTracker,
+  type RawVoiceState,
+} from "../src/speaker-tracker";
 
 function vs(id: string, name: string, extra: Partial<RawVoiceState> = {}): RawVoiceState {
   return { user: { id, username: name, discriminator: "0" }, ...extra };
@@ -24,6 +29,54 @@ describe("buildAvatarUrl", () => {
     expect(buildAvatarUrl(String(6n << 22n), null, undefined)).toBe(
       "https://cdn.discordapp.com/embed/avatars/0.png", // 6 % 6
     );
+  });
+});
+
+describe("buildGuildIconUrl", () => {
+  const GID = "100000000000000001";
+
+  it("rebuilds a valid CDN icon URL as .png with size", () => {
+    expect(buildGuildIconUrl(GID, `https://cdn.discordapp.com/icons/${GID}/hash123.webp`)).toBe(
+      `https://cdn.discordapp.com/icons/${GID}/hash123.png?size=128`,
+    );
+  });
+
+  it("keeps animated a_ hashes (static .png frame)", () => {
+    expect(buildGuildIconUrl(GID, `https://cdn.discordapp.com/icons/${GID}/a_hash.gif`)).toBe(
+      `https://cdn.discordapp.com/icons/${GID}/a_hash.png?size=128`,
+    );
+  });
+
+  it("fails closed on a guild-id mismatch (peer-controlled URL must not be trusted)", () => {
+    expect(
+      buildGuildIconUrl(GID, "https://cdn.discordapp.com/icons/200000000000000002/hash.png"),
+    ).toBeNull();
+  });
+
+  it("fails closed on a non-CDN host and on protocol confusion", () => {
+    expect(buildGuildIconUrl(GID, `https://evil.example.com/icons/${GID}/hash.png`)).toBeNull();
+    expect(buildGuildIconUrl(GID, `http://cdn.discordapp.com/icons/${GID}/hash.png`)).toBeNull();
+    expect(
+      buildGuildIconUrl(GID, `https://cdn.discordapp.com.evil.example/icons/${GID}/hash.png`),
+    ).toBeNull();
+  });
+
+  it("fails closed on missing input", () => {
+    expect(buildGuildIconUrl(GID, null)).toBeNull();
+    expect(buildGuildIconUrl(GID, undefined)).toBeNull();
+    expect(buildGuildIconUrl(GID, "")).toBeNull();
+  });
+
+  it("fails closed on an oversized hash (a squatting peer can ship 16 MiB frames)", () => {
+    const huge = "a".repeat(1_000_000);
+    expect(buildGuildIconUrl(GID, `https://cdn.discordapp.com/icons/${GID}/${huge}.png`)).toBeNull();
+    // 64 chars is the cap; 65 must fail.
+    expect(
+      buildGuildIconUrl(GID, `https://cdn.discordapp.com/icons/${GID}/${"a".repeat(65)}.png`),
+    ).toBeNull();
+    expect(
+      buildGuildIconUrl(GID, `https://cdn.discordapp.com/icons/${GID}/${"a".repeat(64)}.png`),
+    ).toBe(`https://cdn.discordapp.com/icons/${GID}/${"a".repeat(64)}.png?size=128`);
   });
 });
 

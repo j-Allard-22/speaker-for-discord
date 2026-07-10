@@ -38,6 +38,7 @@ const SECRET_SNAPSHOT: HelperToPluginMessage[] = [
     type: "channel",
     channelId: "c1",
     guildId: "g1",
+    guildIconUrl: "https://cdn.discordapp.com/icons/g1/secret.png?size=128",
     channelName: "Secret Ops",
     members: [{ userId: "42", displayName: "Alice", avatarUrl: "https://cdn.discordapp.com/x.png" }],
   },

@@ -60,6 +60,27 @@ export function buildAvatarUrl(
   return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
 }
 
+/**
+ * GET_GUILD returns `icon_url` as a full URL string. Never forward it: a peer squatting
+ * the discord-ipc pipe could inject an arbitrary URL, and the plugin's fetch must stay
+ * host-pinned (SECURITY.md). Strictly parse the hash, cross-check the guild id, and
+ * REBUILD the URL. Fail-closed: anything unexpected -> null -> dim-mic idle key.
+ */
+export function buildGuildIconUrl(
+  guildId: string,
+  rpcIconUrl: string | null | undefined,
+): string | null {
+  if (!rpcIconUrl) return null;
+  // Hash capped at 64 chars (real hashes: 32 hex, or "a_" + 32) — an uncapped capture
+  // would let a 16 MiB frame smuggle a multi-megabyte URL through the rebuild.
+  const m = /^https:\/\/cdn\.discordapp\.com\/icons\/(\d{17,20})\/([A-Za-z0-9_]{1,64})\.(?:png|jpe?g|webp|gif)/.exec(
+    rpcIconUrl,
+  );
+  if (!m || m[1] !== guildId) return null;
+  // .png works for animated "a_..." hashes too (static frame; setImage can't animate).
+  return `https://cdn.discordapp.com/icons/${guildId}/${m[2]}.png?size=128`;
+}
+
 export function memberFromVoiceState(vs: RawVoiceState): TrackedMember | null {
   const user = vs.user;
   if (!user?.id) return null;

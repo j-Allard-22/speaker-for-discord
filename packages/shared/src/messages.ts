@@ -84,6 +84,8 @@ export interface ChannelMessage {
   type: "channel";
   channelId: string | null;
   guildId: string | null;
+  /** Helper-built https://cdn.discordapp.com/icons/... URL, or null (no guild / no icon). */
+  guildIconUrl: string | null;
   channelName: string | null;
   members: MemberInfo[];
 }

@@ -50,6 +50,8 @@ export interface SpeakerStoreState {
   status: DiscordStatus;
   statusDetail?: string;
   channelName: string | null;
+  /** Guild icon of the current voice channel — null in DMs / when the guild has no icon. */
+  guildIconUrl: string | null;
   members: MemberInfo[];
   speaker: MemberInfo | null;
   speakingCount: number;
@@ -63,6 +65,7 @@ function initialState(): SpeakerStoreState {
     identity: null,
     status: "disconnected",
     channelName: null,
+    guildIconUrl: null,
     members: [],
     speaker: null,
     speakingCount: 0,
@@ -235,7 +238,12 @@ export class HelperClient extends EventEmitter {
           });
           break;
         case "channel":
-          this.opts.store.patch({ channelName: msg.channelName, members: msg.members });
+          this.opts.store.patch({
+            channelName: msg.channelName,
+            // ?? null: compat seam for an old helper build that omits the field.
+            guildIconUrl: msg.guildIconUrl ?? null,
+            members: msg.members,
+          });
           break;
         case "speaker":
           this.opts.store.patch({ speaker: msg.speaker, speakingCount: msg.speakingCount });

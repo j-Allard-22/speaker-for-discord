@@ -12,6 +12,10 @@ describe("S9 regression: avatar URLs are host-pinned (no SSRF)", () => {
   it("accepts only https cdn.discordapp.com", () => {
     expect(isAllowedAvatarUrl("https://cdn.discordapp.com/avatars/1/abc.png?size=128")).toBe(true);
     expect(isAllowedAvatarUrl("https://cdn.discordapp.com/embed/avatars/3.png")).toBe(true);
+    // Guild icons (idle key) ride the same pinned host.
+    expect(
+      isAllowedAvatarUrl("https://cdn.discordapp.com/icons/100000000000000001/hash.png?size=128"),
+    ).toBe(true);
   });
 
   it("rejects other hosts, schemes, and lookalikes", () => {

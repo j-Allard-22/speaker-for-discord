@@ -5,7 +5,7 @@
  */
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { renderInitialsKey, renderSpeakerKey } from "../src/render/key-svg";
+import { renderIdleGuildKey, renderInitialsKey, renderSpeakerKey } from "../src/render/key-svg";
 import {
   AUTH_NEEDED_KEY,
   AUTHORIZING_KEY,
@@ -23,7 +23,8 @@ const RED_PX =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 const cells: Array<[string, string]> = [
-  ["idle", IDLE_KEY],
+  ["idle (no icon)", IDLE_KEY],
+  ["idle (guild icon)", renderIdleGuildKey(RED_PX)],
   ["connecting", CONNECTING_KEY],
   ["authorizing", AUTHORIZING_KEY],
   ["auth needed", AUTH_NEEDED_KEY],
@@ -33,6 +34,7 @@ const cells: Array<[string, string]> = [
   ["helper down", HELPER_DOWN_KEY],
   ["port conflict", PORT_CONFLICT_KEY],
   ["speaker (avatar)", renderSpeakerKey("Ada L.", RED_PX)],
+  ["speaker (long name)", renderSpeakerKey("Bartholomew III", RED_PX)],
   ["speaker (initials)", renderInitialsKey("Bartholomew III", "987654321")],
   ["speaker (emoji)", renderInitialsKey("👨‍👩‍👧‍👦 Fam", "123")],
 ];

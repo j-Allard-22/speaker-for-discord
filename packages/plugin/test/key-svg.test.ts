@@ -3,6 +3,7 @@ import {
   escapeXml,
   fallbackColor,
   graphemes,
+  renderIdleGuildKey,
   renderInitialsKey,
   renderSpeakerKey,
   truncateName,
@@ -43,13 +44,23 @@ describe("truncateName", () => {
 });
 
 describe("key SVGs", () => {
-  it("speaker key embeds the avatar and a pixel-bounded name band", () => {
+  it("speaker key embeds the avatar and a pixel-bounded, outlined name", () => {
     const svg = renderSpeakerKey("Jo <&> :3", "QUJD"); // short enough to skip truncation
     expect(svg).toContain('width="72" height="72"');
     expect(svg).toContain("data:image/png;base64,QUJD");
     expect(svg).toContain('textLength="68"'); // hard pixel bound for wide glyphs
     expect(svg).toContain("Jo &lt;&amp;&gt; :3"); // escaped
     expect(svg).not.toContain("Jo <&>"); // raw '<' never survives
+    // Outline = black-stroked layer under a white-filled layer — no banner rect.
+    expect(svg).toContain('stroke="#000000"');
+    expect(svg).toContain('stroke-linejoin="round"');
+    expect(svg).not.toContain("rgba(0,0,0,0.62)");
+    expect(svg.split("Jo &lt;&amp;&gt; :3")).toHaveLength(3); // label rendered twice
+    // ORDER matters: the stroke layer must come FIRST or the outline covers the fill
+    // (paint-order is unreliable in the Stream Deck rasterizer — see nameLabel).
+    expect(svg.indexOf('fill="#ffffff"')).toBeGreaterThan(svg.indexOf('stroke="#000000"'));
+    // The pixel bound must sit on BOTH layers or stroke and fill render at different widths.
+    expect(svg.match(/textLength="68"/g)).toHaveLength(2);
   });
 
   it("initials key uses a deterministic per-user color and the first grapheme", () => {
@@ -57,5 +68,14 @@ describe("key SVGs", () => {
     expect(svg).toContain(fallbackColor("12345"));
     expect(svg).toContain("👨‍👩‍👧‍👦"); // whole cluster, not a slice of it
     expect(fallbackColor("12345")).toBe(fallbackColor("12345")); // stable
+  });
+
+  it("idle guild key dims the icon with an overlay and carries no text", () => {
+    const svg = renderIdleGuildKey("QUJD");
+    expect(svg).toContain("data:image/png;base64,QUJD");
+    expect(svg).toContain("rgba(0,0,0,0.55)"); // dim overlay
+    expect(svg).not.toContain("<text"); // no name, no label
+    // ORDER matters: the overlay must paint AFTER the image or nothing is dimmed.
+    expect(svg.indexOf("rgba(0,0,0,0.55)")).toBeGreaterThan(svg.indexOf("<image"));
   });
 });

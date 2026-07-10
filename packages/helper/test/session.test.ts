@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { MemberInfo } from "@dsd/shared";
 import { DiscordSession } from "../src/discord/session";
-import type { DiscordRpcClient } from "../src/discord/rpc-client";
+import { RpcClosedError, type DiscordRpcClient } from "../src/discord/rpc-client";
 import { TokenStore } from "../src/discord/token-store";
 import { HelperLogger } from "../src/logger";
 import { SpeakerTracker, type RawVoiceState } from "../src/speaker-tracker";
@@ -88,11 +88,17 @@ function makeSession(client: ScriptedClient, clientFactory?: () => ScriptedClien
 
 describe("DiscordSession bootstrap", () => {
   it("subscribes in the race-safe order and installs the GET_CHANNEL roster last", async () => {
-    const client = new ScriptedClient((cmd, _args, evt) => {
+    const GID = "100000000000000001"; // realistic snowflake — buildGuildIconUrl is strict
+    const client = new ScriptedClient((cmd, args, evt) => {
       if (cmd === "SUBSCRIBE") return { evt };
       if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
       if (cmd === "GET_CHANNEL")
-        return { id: "c1", name: "General", guild_id: "g1", voice_states: [vs("A", "Alice")] };
+        return { id: "c1", name: "General", guild_id: GID, voice_states: [vs("A", "Alice")] };
+      if (cmd === "GET_GUILD") {
+        expect(args).toEqual({ guild_id: GID });
+        // .webp on purpose: the helper must REBUILD the URL (as .png), never forward it.
+        return { icon_url: `https://cdn.discordapp.com/icons/${GID}/iconhash.webp` };
+      }
       throw new Error(`unexpected ${cmd}`);
     });
     const { session, tracker } = makeSession(client);
@@ -103,7 +109,8 @@ describe("DiscordSession bootstrap", () => {
     await vi.waitFor(() => expect(session.status.discord).toBe("subscribed"));
 
     // Order: VOICE_CHANNEL_SELECT first, then GET_SELECTED_VOICE_CHANNEL (id only),
-    // then the 5 channel events, then GET_CHANNEL as the authoritative roster.
+    // then the 5 channel events, then GET_CHANNEL as the authoritative roster
+    // (+ GET_GUILD for the idle-key icon).
     const cmdSeq = client.commands.map((c) => c.evt ?? c.cmd);
     expect(cmdSeq).toEqual([
       "VOICE_CHANNEL_SELECT",
@@ -114,9 +121,108 @@ describe("DiscordSession bootstrap", () => {
       "SPEAKING_START",
       "SPEAKING_STOP",
       "GET_CHANNEL",
+      "GET_GUILD",
     ]);
     expect(tracker.memberList.map((m) => m.userId)).toEqual(["A"]);
-    expect(session.channel).toEqual({ channelId: "c1", guildId: "g1", channelName: "General" });
+    expect(session.channel).toEqual({
+      channelId: "c1",
+      guildId: GID,
+      guildIconUrl: `https://cdn.discordapp.com/icons/${GID}/iconhash.png?size=128`,
+      channelName: "General",
+    });
+    session.stop();
+  });
+
+  it("GET_GUILD failure is cosmetic: bootstrap still subscribes, icon falls back to null", async () => {
+    const client = new ScriptedClient((cmd, _args, evt) => {
+      if (cmd === "SUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL")
+        return {
+          id: "c1",
+          name: "General",
+          guild_id: "100000000000000001",
+          voice_states: [vs("A", "Alice")],
+        };
+      if (cmd === "GET_GUILD") throw new Error("guild fetch denied");
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const { session, tracker } = makeSession(client);
+
+    session.startFromStored();
+    await vi.waitFor(() => expect(session.status.discord).toBe("subscribed"));
+    expect(tracker.memberList.map((m) => m.userId)).toEqual(["A"]);
+    expect(session.channel.guildId).toBe("100000000000000001");
+    expect(session.channel.guildIconUrl).toBeNull();
+    session.stop();
+  });
+
+  it("a pipe close during GET_GUILD aborts the bootstrap (no spurious subscribed)", async () => {
+    // RpcClosedError is a SESSION failure: swallowing it would let the dead
+    // bootstrap's tail run and broadcast "subscribed" (which wipes authRequired).
+    const live = new ScriptedClient((cmd, _args, evt) => {
+      if (cmd === "SUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL")
+        return {
+          id: "c1",
+          name: "General",
+          guild_id: "100000000000000001",
+          voice_states: [vs("A", "Alice")],
+        };
+      if (cmd === "GET_GUILD") throw new RpcClosedError("connection closed");
+      throw new Error(`unexpected ${cmd}`);
+    });
+    let calls = 0;
+    // Second dial never settles, so the retry loop parks deterministically.
+    const { session, tracker, sleeps } = makeSession(live, () =>
+      ++calls === 1 ? live : stalledClient(),
+    );
+    const statuses: string[] = [];
+    session.on("status", (s: string) => statuses.push(s));
+
+    session.startFromStored();
+    await vi.waitFor(() => expect(sleeps.length).toBeGreaterThan(0)); // failed -> backed off
+    expect(statuses).not.toContain("subscribed"); // the dead bootstrap's tail never ran
+    expect(tracker.memberList).toEqual([]); // roster never installed
+    session.stop();
+  });
+
+  it("abandons a stale bootstrap when the channel switches during GET_GUILD", async () => {
+    let releaseGuild: (() => void) | null = null;
+    const client = new ScriptedClient(async (cmd, args, evt) => {
+      if (cmd === "SUBSCRIBE" || cmd === "UNSUBSCRIBE") return { evt };
+      if (cmd === "GET_SELECTED_VOICE_CHANNEL") return { id: "c1" };
+      if (cmd === "GET_CHANNEL") {
+        const id = String(args?.["channel_id"]);
+        return id === "c1"
+          ? { id, name: "OLD", guild_id: "100000000000000001", voice_states: [vs("OLD", "OldGuy")] }
+          : { id, name: "NEW", guild_id: null, voice_states: [vs("NEW", "NewGuy")] };
+      }
+      if (cmd === "GET_GUILD") {
+        await new Promise<void>((r) => (releaseGuild = r));
+        return { icon_url: "https://cdn.discordapp.com/icons/100000000000000001/hash.png" };
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const { session, tracker } = makeSession(client);
+    session.startFromStored();
+
+    // Wait until c1's GET_GUILD is in flight, then switch to c2 BEFORE it resolves.
+    await vi.waitFor(() => expect(releaseGuild).not.toBeNull());
+    client.dispatch("VOICE_CHANNEL_SELECT", { channel_id: "c2", guild_id: null });
+    await vi.waitFor(() => expect(session.channel.channelName).toBe("NEW"));
+
+    // Resolve the STALE c1 fetch — its roster and icon must be discarded.
+    releaseGuild!();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(tracker.memberList.map((m) => m.userId)).toEqual(["NEW"]);
+    expect(session.channel).toEqual({
+      channelId: "c2",
+      guildId: null,
+      guildIconUrl: null,
+      channelName: "NEW",
+    });
     session.stop();
   });
 

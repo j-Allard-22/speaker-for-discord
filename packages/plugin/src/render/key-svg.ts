@@ -1,14 +1,13 @@
 /**
  * Speaker-key SVG. The whole key is ONE 72x72 SVG (setTitle("") suppresses overlays):
- * avatar fills the key, a dark bottom band carries the truncated name.
+ * avatar fills the key, the truncated name sits at the bottom as white text with a
+ * black outline (no banner — the avatar stays visible behind the label).
  *
  * Safety rails:
  * - every user-controlled string passes escapeXml (names can contain < & " ')
  * - truncation uses Intl.Segmenter graphemes (code-point slicing shreds ZWJ emoji)
  * - textLength="68" hard-bounds the pixel width regardless of glyph widths
  */
-
-const BAND_TOP = 53;
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
@@ -49,31 +48,35 @@ export function fallbackColor(userId: string): string {
   return FALLBACK_COLORS[hash % FALLBACK_COLORS.length]!;
 }
 
-function nameBand(name: string): string {
+function nameLabel(name: string): string {
   const truncated = truncateName(name);
   const label = escapeXml(truncated);
   // textLength hard-bounds wide glyphs — but it also STRETCHES short names, so only
-  // apply it when the name is long enough to plausibly overflow the 68 px band.
+  // apply it when the name is long enough to plausibly overflow 68 px.
   const bound =
     graphemes(truncated).length > 8 ? ` textLength="68" lengthAdjust="spacingAndGlyphs"` : "";
+  const common =
+    `x="36" y="66" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif"` +
+    ` font-size="11" font-weight="600"${bound}`;
+  // Two passes instead of paint-order="stroke fill": the Stream Deck rasterizer may not
+  // support paint-order, and the default order would draw the stroke OVER the fill.
   return (
-    `<rect x="0" y="${BAND_TOP}" width="72" height="${72 - BAND_TOP}" fill="rgba(0,0,0,0.62)"/>` +
-    `<text x="36" y="66" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif"` +
-    ` font-size="11" font-weight="600" fill="#ffffff"${bound}>${label}</text>`
+    `<text ${common} fill="#000000" stroke="#000000" stroke-width="3" stroke-linejoin="round">${label}</text>` +
+    `<text ${common} fill="#ffffff">${label}</text>`
   );
 }
 
-/** Avatar (base64 PNG) filling the key + name band. */
+/** Avatar (base64 PNG) filling the key + outlined name. */
 export function renderSpeakerKey(name: string, avatarPngB64: string): string {
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72">` +
     `<image href="data:image/png;base64,${avatarPngB64}" x="0" y="0" width="72" height="72" preserveAspectRatio="xMidYMid slice"/>` +
-    nameBand(name) +
+    nameLabel(name) +
     `</svg>`
   );
 }
 
-/** No avatar available: colored disc + first grapheme + name band. */
+/** No avatar available: colored disc + first grapheme + outlined name. */
 export function renderInitialsKey(name: string, userId: string): string {
   const initial = escapeXml(graphemes(name)[0] ?? "?");
   return (
@@ -82,7 +85,18 @@ export function renderInitialsKey(name: string, userId: string): string {
     `<circle cx="36" cy="28" r="20" fill="${fallbackColor(userId)}"/>` +
     `<text x="36" y="36" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif"` +
     ` font-size="20" font-weight="700" fill="#ffffff">${initial}</text>` +
-    nameBand(name) +
+    nameLabel(name) +
+    `</svg>`
+  );
+}
+
+/** Idle in VC: the guild's icon, dimmed, no text. Overlay rect, not image opacity (proven pattern). */
+export function renderIdleGuildKey(iconPngB64: string): string {
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72">` +
+    `<rect width="72" height="72" fill="#1e1f22"/>` +
+    `<image href="data:image/png;base64,${iconPngB64}" x="0" y="0" width="72" height="72" preserveAspectRatio="xMidYMid slice"/>` +
+    `<rect width="72" height="72" fill="rgba(0,0,0,0.55)"/>` +
     `</svg>`
   );
 }

@@ -160,5 +160,20 @@ describe("parseHelperMessage", () => {
   it("passes through state messages", () => {
     const msg = parseHelperMessage(JSON.stringify({ type: "speaker", speaker: null, speakingCount: 0 }));
     expect(msg?.type).toBe("speaker");
+
+    const channel = parseHelperMessage(
+      JSON.stringify({
+        type: "channel",
+        channelId: "c1",
+        guildId: "g1",
+        guildIconUrl: "https://cdn.discordapp.com/icons/g1/h.png?size=128",
+        channelName: "General",
+        members: [],
+      }),
+    );
+    expect(channel).toMatchObject({
+      type: "channel",
+      guildIconUrl: "https://cdn.discordapp.com/icons/g1/h.png?size=128",
+    });
   });
 });

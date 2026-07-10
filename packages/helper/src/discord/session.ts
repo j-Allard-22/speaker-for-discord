@@ -20,6 +20,7 @@ import { EventEmitter } from "node:events";
 import type { DiscordStatus } from "@dsd/shared";
 import type { HelperLogger } from "../logger.js";
 import type { RawVoiceState, SpeakerTracker } from "../speaker-tracker.js";
+import { buildGuildIconUrl } from "../speaker-tracker.js";
 import {
   AuthNeededError,
   ConsentRequiredError,
@@ -46,6 +47,8 @@ const MAX_BACKOFF_MS = 30_000;
 export interface ChannelInfo {
   channelId: string | null;
   guildId: string | null;
+  /** Built by the helper from the GET_GUILD icon hash — never forwarded raw. */
+  guildIconUrl: string | null;
   channelName: string | null;
 }
 
@@ -74,7 +77,12 @@ export class DiscordSession extends EventEmitter {
   private stopped = false;
   private generation = 0;
   private currentChannelId: string | null = null;
-  private channelInfo: ChannelInfo = { channelId: null, guildId: null, channelName: null };
+  private channelInfo: ChannelInfo = {
+    channelId: null,
+    guildId: null,
+    guildIconUrl: null,
+    channelName: null,
+  };
   private bootstrapBuffer: Array<{ evt: string; data: Record<string, unknown> }> | null = null;
 
   private backoffExp = 0;
@@ -124,7 +132,7 @@ export class DiscordSession extends EventEmitter {
     this.client = null;
     this.deps.store.clear();
     this.deps.tracker.clear();
-    this.setChannel({ channelId: null, guildId: null, channelName: null });
+    this.setChannel({ channelId: null, guildId: null, guildIconUrl: null, channelName: null });
     this.setStatus("awaiting_credentials");
     this.emit("authRequired", "no_credentials");
   }
@@ -236,7 +244,7 @@ export class DiscordSession extends EventEmitter {
         // Healthy session: wait for the pipe to die, then loop for a reconnect.
         await this.waitForClose(client);
         this.deps.tracker.clear();
-        this.setChannel({ channelId: null, guildId: null, channelName: null });
+        this.setChannel({ channelId: null, guildId: null, guildIconUrl: null, channelName: null });
         this.setStatus("disconnected", "Discord connection lost");
         // MUST back off here. A Discord that accepts the handshake and then immediately
         // drops the pipe (restart/flap) would otherwise reconnect in a tight loop, each
@@ -246,7 +254,7 @@ export class DiscordSession extends EventEmitter {
       } catch (err) {
         client.close();
         this.deps.tracker.clear();
-        this.setChannel({ channelId: null, guildId: null, channelName: null });
+        this.setChannel({ channelId: null, guildId: null, guildIconUrl: null, channelName: null });
 
         if (this.stopped) break;
 
@@ -444,7 +452,7 @@ export class DiscordSession extends EventEmitter {
     const channelId = selected?.id ?? null;
     if (!channelId) {
       this.currentChannelId = null;
-      this.setChannel({ channelId: null, guildId: null, channelName: null });
+      this.setChannel({ channelId: null, guildId: null, guildIconUrl: null, channelName: null });
       this.setStatus("no_channel");
       return;
     }
@@ -465,7 +473,7 @@ export class DiscordSession extends EventEmitter {
     }
 
     if (!channelId) {
-      this.setChannel({ channelId: null, guildId: null, channelName: null });
+      this.setChannel({ channelId: null, guildId: null, guildIconUrl: null, channelName: null });
       this.setStatus("no_channel");
       return;
     }
@@ -475,8 +483,9 @@ export class DiscordSession extends EventEmitter {
   }
 
   /**
-   * Race-safe bootstrap: SUBSCRIBE x5 -> buffer events -> GET_CHANNEL roster installed
-   * LAST -> replay buffer. Abandons silently whenever a newer generation exists.
+   * Race-safe bootstrap: SUBSCRIBE x5 -> buffer events -> GET_CHANNEL (+ GET_GUILD for
+   * the icon) -> roster installed LAST -> replay buffer. Abandons silently whenever a
+   * newer generation exists.
    */
   private async bootstrapChannel(client: DiscordRpcClient, channelId: string): Promise<void> {
     const gen = ++this.generation;
@@ -502,6 +511,30 @@ export class DiscordSession extends EventEmitter {
       };
       if (stale()) return abandon();
 
+      // Guild icon for the idle key. The buffer keeps absorbing events during this
+      // await, so the roster-installed-last invariant below is untouched.
+      const guildId = (channel?.guild_id as string | null) ?? null;
+      let guildIconUrl: string | null = null;
+      if (guildId) {
+        try {
+          const guild = (await client.sendCommand("GET_GUILD", { guild_id: guildId })) as {
+            icon_url?: string | null;
+          } | null;
+          guildIconUrl = buildGuildIconUrl(guildId, guild?.icon_url);
+        } catch (err) {
+          // A closed pipe is a SESSION failure, not an icon failure — propagate like a
+          // GET_CHANNEL rejection would, or a dead bootstrap's tail would still run
+          // (stale() can be false: stop/forgetCredentials never bump the generation)
+          // and emit a spurious "subscribed" that wipes authRequired everywhere.
+          if (err instanceof RpcClosedError) throw err;
+          // Anything else: the icon is cosmetic — never fail bootstrap over it.
+          this.deps.logger.debug("GET_GUILD failed; idle key falls back to mic", {
+            message: String(err),
+          });
+        }
+        if (stale()) return abandon();
+      }
+
       this.currentChannelId = channelId;
       this.deps.tracker.setRoster(channel?.voice_states ?? []);
 
@@ -511,7 +544,8 @@ export class DiscordSession extends EventEmitter {
 
       this.setChannel({
         channelId,
-        guildId: (channel?.guild_id as string | null) ?? null,
+        guildId,
+        guildIconUrl,
         channelName: channel?.name ?? null,
       });
       this.setStatus("subscribed", channel?.name ? `#${channel.name}` : undefined);
