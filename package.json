@@ -1,6 +1,6 @@
 {
   "name": "speaker-for-discord",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Stream Deck plugin showing the currently-speaking member of your Discord voice channel.",
   "license": "MIT",
   "repository": {

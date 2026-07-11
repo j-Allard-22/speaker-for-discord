@@ -2,7 +2,7 @@
   "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
   "UUID": "com.vitamin.speaker-for-discord",
   "Name": "Speaker for Discord",
-  "Version": "1.0.0.0",
+  "Version": "1.1.0.0",
   "Author": "Vitamin",
   "Description": "Shows the currently-speaking member of your Discord voice channel on a key: avatar and name, live.",
   "URL": "https://github.com/j-Allard-22/speaker-for-discord",
